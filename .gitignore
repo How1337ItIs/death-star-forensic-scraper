@@ -1,0 +1,25 @@
+# Output and state
+output/
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
