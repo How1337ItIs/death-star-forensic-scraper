@@ -4,7 +4,23 @@ The folder is already a git repo on `main`. Two ways to publish:
 
 ---
 
-## Option A: Script (uses same token as Cursor GitHub MCP)
+## Option A: Copy token from deadhead-llm (sister project)
+
+If you use **deadhead-llm**, put your GitHub token there once and reuse it here:
+
+1. In **deadhead-llm**, add to `deadhead-llm\.env` (create if needed):
+   ```bash
+   GITHUB_TOKEN=your_github_personal_access_token
+   ```
+2. From this folder run:
+   ```powershell
+   .\copy_token_from_deadhead_llm.ps1
+   ```
+   That copies the token to `%USERPROFILE%\.github-mcp-token` and runs the create/push script.
+
+---
+
+## Option B: Script (uses same token as Cursor GitHub MCP)
 
 If you use the Cursor GitHub MCP, your token is in **`%USERPROFILE%\.github-mcp-token`** (one line, no quotes). From this folder:
 
@@ -22,7 +38,7 @@ If the token file is missing, create it:
 
 ---
 
-## Option B: Manual (create repo in browser, then push)
+## Option C: Manual (create repo in browser, then push)
 
 ### 1. Create the repo on GitHub
 
