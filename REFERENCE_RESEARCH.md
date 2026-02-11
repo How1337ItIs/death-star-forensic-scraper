@@ -127,3 +127,96 @@ git clone --depth 1 https://github.com/gildas-lormeau/SingleFile.git reference/S
 - **Next steps (by impact):** WACZ export → Single-file HTML or SingleFile CLI → Favicon/title → Readability/Mercury → SavePageNow → Block rules / behaviors → Optional plugin registry and signed WACZ.
 
 Use `reference/` as the local reference when implementing any of the above.
+
+---
+
+## Additional Scrapers (not yet studied)
+
+Effective, mature, open-source scrapers worth cloning for more patterns. Run from repo root:
+
+```bash
+mkdir -p reference
+# Already have: warcio, py-wacz, browsertrix-crawler, ArchiveBox, SingleFile
+
+# New: archival & scale
+git clone --depth 1 https://github.com/internetarchive/heritrix3.git reference/heritrix3
+git clone --depth 1 https://github.com/scrapy/scrapy.git reference/scrapy
+git clone --depth 1 https://github.com/q-m/scrapy-webarchive.git reference/scrapy-webarchive
+
+# New: browser-based / high-fidelity
+git clone --depth 1 https://github.com/N0taN3rd/Squidwarc.git reference/Squidwarc
+git clone --depth 1 https://github.com/webrecorder/archiveweb.page.git reference/archiveweb.page
+git clone --depth 1 https://github.com/ganapativs/puppeteer-warc.git reference/puppeteer-warc
+
+# New: simple archivers & utilities
+git clone --depth 1 https://github.com/turicas/crau.git reference/crau
+git clone --depth 1 https://github.com/webrecorder/warcit.git reference/warcit
+```
+
+Or run the script: `./scripts/clone_reference.sh` (or `scripts\clone_reference.bat` on Windows).
+
+| Repo | Stack | Purpose | What to steal |
+|------|--------|---------|----------------|
+| **internetarchive/heritrix3** | Java | IA’s web-scale archival crawler | Crawl order, frontier, robots handling, WARC writing at scale, job config (crawl scope, politeness). |
+| **scrapy/scrapy** | Python | Most-used scraping framework | Middleware pipeline, request/response lifecycle, item pipelines, Scrapyd deployment, rate limiting. |
+| **q-m/scrapy-webarchive** | Python | Scrapy → WARC/WACZ | How to plug WARC/WACZ into a crawler pipeline; datapackage.json, ZIP layout for WACZ. |
+| **N0taN3rd/Squidwarc** | Node/Chrome | High-fidelity scriptable crawler | User scripts, CDP capture patterns, crawl modes (page / same-domain / links), config schema. |
+| **webrecorder/archiveweb.page** | Extension | In-browser high-fidelity archiving | Extension UX, recording flow, WACZ from browser (same ecosystem as Browsertrix). |
+| **ganapativs/puppeteer-warc** | Node/Puppeteer | Browser → WARC + screenshots | Puppeteer→WARC pattern (close to our Playwright path); request/response capture, screenshot hook. |
+| **turicas/crau** | Python | Simple CLI archiver | `crau archive/list/extract/play`; minimal API for “URL list → WARC” and local replay. |
+| **webrecorder/warcit** | Node | Files/dirs → WARC | Turning a mirrored tree or ZIP into valid WARC (post-process mirror → archive). |
+
+### Other notable (no clone yet)
+
+- **HTTrack** (httrack.com) — Classic recursive site copier (GPL); mirroring heuristics, not WARC.
+- **Common Crawl** — Dataset only; use for testing against real crawl data.
+- **crawl** (git.jordan.im/crawl) — Go recursive crawler → WARC; resume, binding; smaller community.
+- **JustAnotherArchivist/qwarc** — High-throughput URL archiver; use responsibly.
+
+---
+
+## More “everything” archivers
+
+Full-site / full-fidelity / save-everything archivers. Clone for patterns (replay, dashboard, permanent links, bookmark→archive).
+
+```bash
+# Everything archivers (run from repo root; reference/ in .gitignore)
+git clone --depth 1 https://github.com/ArchiveTeam/grab-site.git reference/grab-site
+git clone --depth 1 https://github.com/webrecorder/pywb.git reference/pywb
+git clone --depth 1 https://github.com/reprozip-news-apps/reprozip-web.git reference/reprozip-web
+git clone --depth 1 https://github.com/rhizome-conifer/conifer.git reference/conifer
+git clone --depth 1 https://github.com/harvard-lil/perma.git reference/perma
+git clone --depth 1 https://github.com/go-shiori/shiori.git reference/shiori
+```
+
+| Repo | Stack | Purpose | What to steal |
+|------|--------|---------|----------------|
+| **ArchiveTeam/grab-site** | Python/shell | Archivist’s crawler: WARC, dashboard, ignore patterns | Crawl dashboard UX, pause/resume, dynamic ignore rules, WARC-focused crawl workflow. |
+| **webrecorder/pywb** | Python | Replay + live capture (Wayback-style), proxy recording | Proxy recording flow, CDX index/API, collection config, replay server; core of Webrecorder stack. |
+| **reprozip-news-apps/reprozip-web** | Python | Full web app preservation: trace app → .rpz (can include .wacz) | Packaging server+frontend for reproducible replay; when you need “app + archive” in one bundle. |
+| **rhizome-conifer/conifer** | Full stack | User-facing high-fidelity archiving service (Conifer) | How to wrap Webrecorder (frontend, nginx, redis, webrecorder); service UX, auth, quotas. (Service sunsets June 2026; code still useful.) |
+| **harvard-lil/perma** | JS/Django | Permanent citation links: capture URL → stable perma.cc link | “Save URL → stable link” flow, capture pipeline, replay UX, institutional archiving product. |
+| **go-shiori/shiori** | Go | Self-hosted bookmark manager with optional offline archive | Bookmark import (Pocket, Netscape), “archive this page” for offline readable copy, simple API and extension. |
+
+---
+
+## Implemented Steals (Current Codebase)
+
+Borrowed and implemented in `death_star_v2.py`, `forensic_capture.py`, and `archive_utils.py`:
+
+1. **Grab-site style ignore sets + dynamic regex policy**
+   - Built-in global ignore regex subset to avoid analytics/share/login/comment traps.
+   - CLI: `--ignore-patterns`, `--no-global-ignores`, `--include`, `--exclude`.
+
+2. **Scrapy-style frontier priority**
+   - URL queue now supports priority scoring (depth + content heuristics) instead of plain FIFO-by-depth.
+   - Checkpoint schema updated with `priority`.
+
+3. **Browsertrix-style behavior profile + block rules**
+   - Playwright behavior profiles: `minimal`, `archive`, `aggressive`.
+   - CLI controls: `--behavior-profile`, `--wait-until`, `--net-idle-wait`, `--auto-click-selector`.
+   - Regex block rules file support: `--block-rules-file`.
+
+4. **Browsertrix/py-wacz style indexing hardening**
+   - Generate CDXJ sidecar index for each WARC capture.
+   - Optional WACZ validation metadata after generation (when `wacz` CLI is available).

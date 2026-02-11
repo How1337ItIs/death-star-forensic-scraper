@@ -106,9 +106,22 @@ python death_star_v2.py --target https://your-target.com --mode planetary --outp
 
 # Block known ad/tracker resources in Playwright modes
 --block-ads
+--block-rules-file config/block_rules/browsertrix_like.regex
+
+# Playwright behavior controls (Browsertrix-style)
+--behavior-profile {minimal,archive,aggressive}
+--wait-until {domcontentloaded,load,networkidle,commit}
+--net-idle-wait 2.0
+--auto-click-selector "button.accept"
 
 # Submit target URL to Internet Archive SavePageNow
 --save-wayback
+
+# Crawl scope / ignore policy (Browsertrix + Grab-site style)
+--include REGEX
+--exclude REGEX
+--ignore-patterns config/ignore_sets/grabsite_global_minimal.regex
+--no-global-ignores
 
 # Multiple URLs from file
 --targets urls.txt     # one URL per line
@@ -140,6 +153,7 @@ output/
         article.txt
         network.har
     warc/          # Web ARChive
+    cdxj/          # CDXJ sidecar indexes for replay/search
     har/            # HTTP Archive
     wacz/           # ReplayWeb.page compatible package (optional)
     screenshots/

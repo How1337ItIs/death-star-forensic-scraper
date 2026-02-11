@@ -1,0 +1,22 @@
+# Grab-site inspired crawl ignores (subset)
+^https?://(www|ssl)\.google-analytics\.com/(r/)?(__utm\.gif|collect\?)
+^https?://stats\.g\.doubleclick\.net/dc\.js$
+^https?://pixel\.redditmedia\.com/pixel/
+^https?://(www\.)?facebook\.com/(plugins/(share_button|like(box)?)\.php|sharer/sharer\.php|dialog/(feed|share))\?
+^https?://(www\.)?twitter\.com/(share\?|intent/((re)?tweet|favorite))
+^https?://platform\d?\.twitter\.com/widgets/tweet_button\.html\?
+^https?://(www\.)?linkedin\.com/(cws/share|shareArticle)\?
+^https?://([^\.]+\.)?pinterest\.com/pin/create/
+^https?://(www\.)?reddit\.com/(login\?dest=|submit\?|static/button/button)
+^https?://(www\.)?blogger\.com/(navbar\.g|post-edit\.g|delete-comment\.g|share-post\.g|email-post\.g)\?
+^https?://{any_start_netloc}/.+[\?&]share=[a-z]{4,}
+^https?://{any_start_netloc}/.+[\?&](replyto(com)?|like_comment)=\d+
+^https?://{any_start_netloc}/.+\?showComment(=|%5C)\d+
+^https?://mail\.google\.com/mail/
+^https?://accounts\.google\.com/(SignUp|ServiceLogin|AccountChooser|a/UniversalLogin)
+^https?://(www\.)?google\.com/recaptcha/(api|mailhide/d\?)
+^https?://{any_start_netloc}/(wp-admin/|wp-login\.php\?)
+^https?://[^/]+\.facebook\.com/login\.php
+^https?://{any_start_netloc}/.+/jetpack-comment/\?blogid=\d+&postid=\d+
+^https?://{any_start_netloc}/.+/quote-comment-\d+/$
+%25252525

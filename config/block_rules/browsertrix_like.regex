@@ -1,0 +1,13 @@
+# Browsertrix-style block patterns (regex)
+doubleclick\.net
+googletagmanager\.com
+google-analytics\.com
+adservice\.google\.com
+adsystem
+ads-twitter\.com
+facebook\.net/tr
+hotjar\.com
+segment\.com
+optimizely\.com
+pixel\.redditmedia\.com
+/collect\?

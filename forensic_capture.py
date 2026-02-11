@@ -47,6 +47,11 @@ import sys
 
 logger = logging.getLogger("forensic_capture")
 
+try:
+    from archive_utils import generate_cdxj_index
+except ImportError:
+    generate_cdxj_index = None  # type: ignore[assignment]
+
 
 def safe_path_component(value: str) -> str:
     """Make a string safe for cross-platform file and directory names."""
@@ -130,6 +135,7 @@ class ForensicResult:
     # Hashes for integrity
     content_hash: str
     warc_path: Optional[str]
+    cdxj_path: Optional[str]
     wacz_path: Optional[str]
 
 
@@ -154,6 +160,7 @@ class ForensicCapture:
         (self.output_dir / "singlefile").mkdir(exist_ok=True)
         (self.output_dir / "favicons").mkdir(exist_ok=True)
         (self.output_dir / "wacz").mkdir(exist_ok=True)
+        (self.output_dir / "cdxj").mkdir(exist_ok=True)
         (self.output_dir / "metadata").mkdir(exist_ok=True)
         (self.output_dir / "certificates").mkdir(exist_ok=True)
         
@@ -174,6 +181,7 @@ class ForensicCapture:
         generate_warc: bool = True,
         generate_har: bool = True,
         generate_wacz: bool = False,
+        validate_wacz: bool = True,
     ) -> ForensicResult:
         """
         Capture complete forensic data for a page.
@@ -191,6 +199,7 @@ class ForensicCapture:
             generate_warc: Generate WARC archive
             generate_har: Generate HAR file
             generate_wacz: Convert generated WARC into WACZ (requires `wacz` CLI)
+            validate_wacz: Validate generated WACZ package when possible
         
         Returns:
             ForensicResult with all captured data
@@ -315,10 +324,13 @@ class ForensicCapture:
             
             # Generate WARC
             warc_path = None
+            cdxj_path = None
             if generate_warc:
                 warc_path = await self._generate_warc(
                     url, raw_html, self._requests, self._responses, domain_fs, timestamp
                 )
+                if warc_path:
+                    cdxj_path = self._generate_cdxj(warc_path)
 
             # Generate WACZ from WARC if requested
             wacz_path = None
@@ -329,6 +341,8 @@ class ForensicCapture:
                     domain=domain_fs,
                     timestamp=timestamp,
                 )
+                if validate_wacz and wacz_path:
+                    metadata["wacz_validation"] = self._validate_wacz(wacz_path)
             
             # Calculate content hash
             content_hash = hashlib.sha256(raw_html.encode()).hexdigest()
@@ -363,6 +377,7 @@ class ForensicCapture:
                 resource_links=resource_links,
                 content_hash=content_hash,
                 warc_path=warc_path,
+                cdxj_path=cdxj_path,
                 wacz_path=wacz_path,
             )
             
@@ -877,6 +892,45 @@ class ForensicCapture:
         except Exception as e:
             logger.warning(f"WACZ generation failed: {e}")
             return None
+
+    def _generate_cdxj(self, warc_path: str) -> Optional[str]:
+        """Generate CDXJ sidecar index from a WARC file."""
+        if not warc_path or generate_cdxj_index is None:
+            return None
+        try:
+            return generate_cdxj_index(Path(warc_path), self.output_dir / "cdxj")
+        except Exception as e:
+            logger.warning(f"CDXJ generation failed: {e}")
+            return None
+
+    def _validate_wacz(self, wacz_path: str) -> Dict[str, Any]:
+        """Validate WACZ package when `wacz validate` is available."""
+        result = {
+            "attempted": False,
+            "valid": None,
+            "stderr": "",
+        }
+
+        if shutil.which("wacz") is None:
+            return result
+
+        cmd = ["wacz", "validate", "-f", str(wacz_path)]
+        try:
+            process = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            result["attempted"] = True
+            result["valid"] = process.returncode == 0
+            result["stderr"] = (process.stderr or process.stdout or "")[:500]
+            return result
+        except Exception as exc:
+            result["attempted"] = True
+            result["valid"] = None
+            result["stderr"] = str(exc)[:500]
+            return result
     
     def _generate_har(
         self,
@@ -1195,6 +1249,7 @@ def save_forensic_result(result: ForensicResult, output_dir: Path):
         "mhtml_path": result.mhtml_path,
         "favicon_path": result.favicon_path,
         "warc_path": result.warc_path,
+        "cdxj_path": result.cdxj_path,
         "wacz_path": result.wacz_path,
         "article_extraction_method": article.get("method"),
         "article_title": article.get("title"),
@@ -1273,6 +1328,8 @@ if __name__ == "__main__":
         print(f"   Assets captured: {len(result.assets)}")
         print(f"   Screenshot: {result.screenshot_path}")
         print(f"   WARC: {result.warc_path}")
+        if result.cdxj_path:
+            print(f"   CDXJ: {result.cdxj_path}")
         if result.wacz_path:
             print(f"   WACZ: {result.wacz_path}")
         if result.mhtml_path:

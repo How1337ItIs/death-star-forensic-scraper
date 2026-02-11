@@ -118,6 +118,13 @@ def _import_core(module_name: str, *names: str):
     return tuple(getattr(mod, n) for n in names)
 
 
+try:
+    from archive_utils import CrawlPolicy, score_crawl_priority
+except ImportError:
+    CrawlPolicy = None  # type: ignore[assignment]
+    score_crawl_priority = None  # type: ignore[assignment]
+
+
 # JSON-safe serialization for manifests and results
 _JSON_SAFE = (str, int, float, bool, type(None))
 
@@ -313,10 +320,19 @@ class ScrapeConfig:
     generate_wacz: bool = False
     block_ads: bool = False
     save_to_wayback: bool = False
+    use_global_ignores: bool = True
+    ignore_patterns_file: Optional[str] = None
+    scope_include_regex: Optional[str] = None
+    scope_exclude_regex: Optional[str] = None
     
     # Browser settings
     headless: bool = True
     browser_timeout: int = 30000  # ms
+    wait_until: str = "load"  # domcontentloaded|load|networkidle
+    behavior_profile: str = "archive"  # minimal|archive|aggressive
+    net_idle_wait: float = 2.0
+    auto_click_selector: Optional[str] = None
+    block_rules_file: Optional[str] = None
     
     # Proxy settings
     proxy_list: List[str] = field(default_factory=list)
@@ -639,8 +655,10 @@ class EnhancedCheckpoint:
         self.conn.executescript('''
             CREATE TABLE IF NOT EXISTS urls (
                 url TEXT PRIMARY KEY,
+                canonical_url TEXT,
                 domain TEXT,
                 depth INTEGER DEFAULT 0,
+                priority INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'pending',
                 method TEXT,
                 content_hash TEXT,
@@ -673,16 +691,32 @@ class EnhancedCheckpoint:
             CREATE INDEX IF NOT EXISTS idx_urls_status ON urls(status);
             CREATE INDEX IF NOT EXISTS idx_urls_domain ON urls(domain);
         ''')
+        self._ensure_schema_columns()
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_urls_priority ON urls(priority DESC, depth ASC, added_at ASC)"
+        )
         self.conn.commit()
+
+    def _ensure_schema_columns(self):
+        """Lightweight migration for older checkpoints."""
+        columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(urls)").fetchall()
+        }
+
+        if "priority" not in columns:
+            self.conn.execute("ALTER TABLE urls ADD COLUMN priority INTEGER DEFAULT 0")
+        if "canonical_url" not in columns:
+            self.conn.execute("ALTER TABLE urls ADD COLUMN canonical_url TEXT")
     
-    def add_url(self, url: str, depth: int = 0) -> bool:
+    def add_url(self, url: str, depth: int = 0, priority: int = 0) -> bool:
         """Add URL to queue if not already present."""
         domain = urlparse(url).netloc
         try:
             self.conn.execute('''
-                INSERT OR IGNORE INTO urls (url, domain, depth, added_at)
-                VALUES (?, ?, ?, ?)
-            ''', (url, domain, depth, datetime.now().isoformat()))
+                INSERT OR IGNORE INTO urls (url, canonical_url, domain, depth, priority, added_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (url, url, domain, depth, priority, datetime.now().isoformat()))
             self.conn.commit()
             return True
         except Exception:
@@ -696,9 +730,9 @@ class EnhancedCheckpoint:
     def get_pending(self, limit: int = 100) -> List[Dict]:
         """Get pending URLs, ordered by depth (breadth-first)."""
         cursor = self.conn.execute('''
-            SELECT url, domain, depth FROM urls
+            SELECT url, domain, depth, priority FROM urls
             WHERE status = 'pending'
-            ORDER BY depth ASC, added_at ASC
+            ORDER BY priority DESC, depth ASC, added_at ASC
             LIMIT ?
         ''', (limit,))
         return [dict(row) for row in cursor]
@@ -1006,17 +1040,40 @@ class PlaywrightFetcher:
     """
 
     DEFAULT_BLOCK_RULES = [
-        "doubleclick.net",
-        "googletagmanager.com",
-        "google-analytics.com",
-        "adservice.google.com",
-        "adsystem.com",
-        "ads-twitter.com",
-        "facebook.net/tr",
-        "hotjar.com",
-        "segment.com",
-        "optimizely.com",
+        r"doubleclick\.net",
+        r"googletagmanager\.com",
+        r"google-analytics\.com",
+        r"adservice\.google\.com",
+        r"adsystem",
+        r"ads-twitter\.com",
+        r"facebook\.net/tr",
+        r"hotjar\.com",
+        r"segment\.com",
+        r"optimizely\.com",
+        r"pixel\.redditmedia\.com",
+        r"/collect\?",
     ]
+
+    BEHAVIOR_PROFILES = {
+        "minimal": {
+            "scroll_passes": 0,
+            "post_load_delay": 0.2,
+            "run_cookie_clicks": False,
+            "autoplay_media": False,
+        },
+        "archive": {
+            "scroll_passes": 2,
+            "post_load_delay": 1.0,
+            "run_cookie_clicks": True,
+            "autoplay_media": True,
+        },
+        "aggressive": {
+            "scroll_passes": 4,
+            "post_load_delay": 1.5,
+            "run_cookie_clicks": True,
+            "autoplay_media": True,
+        },
+    }
     
     def __init__(self, config: ScrapeConfig):
         self.config = config
@@ -1025,6 +1082,7 @@ class PlaywrightFetcher:
         self._playwright = None
         self._block_rules_installed = False
         self._blocked_request_count = 0
+        self._compiled_block_rules = self._load_block_rules()
     
     async def _ensure_browser(self):
         """Ensure browser is running."""
@@ -1102,17 +1160,42 @@ class PlaywrightFetcher:
         
         await self._context.add_init_script(stealth_js)
 
+    def _load_block_rules(self) -> List[re.Pattern]:
+        """Load block rules from defaults + optional file."""
+        patterns = list(self.DEFAULT_BLOCK_RULES)
+
+        if self.config.block_rules_file:
+            path = Path(self.config.block_rules_file)
+            if path.exists():
+                for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    candidate = line.strip()
+                    if candidate and not candidate.startswith("#"):
+                        patterns.append(candidate)
+            else:
+                logger.warning(f"Block rules file not found: {self.config.block_rules_file}")
+
+        compiled: List[re.Pattern] = []
+        for pattern in patterns:
+            try:
+                compiled.append(re.compile(pattern, re.IGNORECASE))
+            except re.error:
+                # Treat non-regex pattern as literal substring.
+                compiled.append(re.compile(re.escape(pattern), re.IGNORECASE))
+        return compiled
+
+    def _get_behavior_profile(self) -> Dict[str, Any]:
+        profile_name = (self.config.behavior_profile or "archive").strip().lower()
+        return dict(self.BEHAVIOR_PROFILES.get(profile_name, self.BEHAVIOR_PROFILES["archive"]))
+
     async def _setup_block_rules(self):
         """Optionally block known tracker/ad resources."""
         if self._block_rules_installed or not self.config.block_ads:
             return
 
-        block_terms = [term.lower() for term in self.DEFAULT_BLOCK_RULES]
-
         async def route_handler(route):
             request = route.request
-            req_url = request.url.lower()
-            if any(term in req_url for term in block_terms):
+            req_url = request.url
+            if any(rule.search(req_url) for rule in self._compiled_block_rules):
                 self._blocked_request_count += 1
                 await route.abort()
             else:
@@ -1120,6 +1203,78 @@ class PlaywrightFetcher:
 
         await self._context.route("**/*", route_handler)
         self._block_rules_installed = True
+
+    async def _run_page_behaviors(self, page):
+        """Run Browsertrix-style post-load behaviors for high-fidelity capture."""
+        profile = self._get_behavior_profile()
+        scroll_passes = int(profile.get("scroll_passes", 0))
+
+        if profile.get("run_cookie_clicks"):
+            await self._click_cookie_buttons(page)
+
+        # Optional targeted autoclick behavior.
+        if self.config.auto_click_selector:
+            try:
+                elements = page.locator(self.config.auto_click_selector)
+                click_count = min(await elements.count(), 8)
+                for idx in range(click_count):
+                    try:
+                        await elements.nth(idx).click(timeout=1500)
+                        await asyncio.sleep(0.15)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        # Autoplay media elements when possible to trigger lazy fetches.
+        if profile.get("autoplay_media"):
+            try:
+                await page.evaluate(
+                    """
+                    () => {
+                        for (const el of document.querySelectorAll("video, audio")) {
+                            try { el.muted = true; el.play(); } catch (_) {}
+                        }
+                    }
+                    """
+                )
+            except Exception:
+                pass
+
+        if scroll_passes > 0:
+            for _ in range(scroll_passes):
+                await self._human_scroll(page)
+                await asyncio.sleep(0.2)
+
+        post_load_delay = float(profile.get("post_load_delay", 0))
+        if post_load_delay > 0:
+            await asyncio.sleep(post_load_delay)
+
+        if self.config.net_idle_wait > 0:
+            try:
+                await page.wait_for_load_state("networkidle", timeout=int(self.config.net_idle_wait * 1000))
+            except Exception:
+                pass
+
+    async def _click_cookie_buttons(self, page):
+        """Dismiss common cookie/privacy banners to expose page content."""
+        selectors = [
+            "button#onetrust-accept-btn-handler",
+            "button:has-text('Accept')",
+            "button:has-text('I agree')",
+            "button:has-text('Accept all')",
+            "[aria-label*='Accept' i]",
+            "[data-testid*='accept']",
+        ]
+        for selector in selectors:
+            try:
+                button = page.locator(selector).first
+                if await button.count() > 0:
+                    await button.click(timeout=1000)
+                    await asyncio.sleep(0.1)
+                    return
+            except Exception:
+                continue
     
     async def fetch(self, url: str) -> Optional[ScrapedPage]:
         """Fetch page with stealth browser."""
@@ -1130,22 +1285,21 @@ class PlaywrightFetcher:
         try:
             blocked_start = self._blocked_request_count
             page = await self._context.new_page()
-            
-            # Navigate: use 'load' to get DOM + resources without waiting for network idle (mirror.xyz etc.)
+
+            wait_until = (self.config.wait_until or "load").strip().lower()
+            if wait_until not in {"domcontentloaded", "load", "networkidle", "commit"}:
+                wait_until = "load"
+
             response = await page.goto(
                 url,
-                wait_until='load',
+                wait_until=wait_until,
                 timeout=self.config.browser_timeout
             )
             
             if not response:
                 return None
-            
-            # Random scroll to trigger lazy loading
-            await self._human_scroll(page)
-            
-            # Wait a bit for any dynamic content
-            await asyncio.sleep(random.uniform(0.5, 1.5))
+
+            await self._run_page_behaviors(page)
             
             # Get content
             raw_html = await page.content()
@@ -1198,6 +1352,8 @@ class PlaywrightFetcher:
                     "js_rendered": True,
                     "blocked_requests": self._blocked_request_count - blocked_start,
                     "block_rules_enabled": self.config.block_ads,
+                    "wait_until": wait_until,
+                    "behavior_profile": self.config.behavior_profile,
                 },
                 scraped_at=datetime.now().isoformat(),
                 method="playwright",
@@ -1446,6 +1602,18 @@ class DeathStarV2:
         self.checkpoint = None
         self.robots = RobotsHandler()
         self.rate_limiter = DomainRateLimiter(self.config)
+        self._target_url = ""
+        self._target_netloc = ""
+
+        if CrawlPolicy:
+            self.crawl_policy = CrawlPolicy(
+                include_regex=self.config.scope_include_regex,
+                exclude_regex=self.config.scope_exclude_regex,
+                ignore_patterns_file=self.config.ignore_patterns_file,
+                use_default_ignore_set=self.config.use_global_ignores,
+            )
+        else:
+            self.crawl_policy = None
         
         # Proxy pool (if configured)
         self.proxy_pool = None
@@ -1620,6 +1788,31 @@ class DeathStarV2:
             self.rate_limiter.record_error(domain)
         
         return result
+
+    def _url_priority(self, url: str, depth: int) -> int:
+        if score_crawl_priority:
+            return score_crawl_priority(url, self._target_netloc, depth)
+        return 1000 - (depth * 100)
+
+    def _queue_url(self, candidate_url: str, depth: int, is_seed: bool = False) -> bool:
+        """Apply policy/canonicalization and queue URL with priority."""
+        if not self.checkpoint:
+            return False
+
+        normalized = candidate_url
+        if self.crawl_policy:
+            allowed, normalized, reason = self.crawl_policy.evaluate_url(
+                candidate_url,
+                self._target_netloc,
+                self.config.follow_external,
+                is_seed=is_seed,
+            )
+            if not allowed or not normalized:
+                logger.debug(f"Skipping URL ({reason}): {candidate_url}")
+                return False
+
+        priority = self._url_priority(normalized, depth)
+        return self.checkpoint.add_url(normalized, depth=depth, priority=priority)
     
     async def destroy(
         self,
@@ -1661,6 +1854,8 @@ class DeathStarV2:
         
         domain = urlparse(url).netloc.replace("www.", "")
         safe_domain = safe_path_component(domain)
+        self._target_url = url
+        self._target_netloc = urlparse(url).netloc.lower()
         logger.info(f"DEATH STAR V2 FIRING ON: {url} (mode={mode})")
         
         # Initialize checkpoint
@@ -1670,10 +1865,10 @@ class DeathStarV2:
         if resume:
             stats = self.checkpoint.stats()
             if stats.get('total', 0) == 0:
-                self.checkpoint.add_url(url, depth=0)
+                self._queue_url(url, depth=0, is_seed=True)
         else:
             self.checkpoint.reset()
-            self.checkpoint.add_url(url, depth=0)
+            self._queue_url(url, depth=0, is_seed=True)
         
         results = {
             "target": url,
@@ -1750,7 +1945,7 @@ class DeathStarV2:
                                     # Stay within domain unless configured otherwise
                                     link_domain = urlparse(link).netloc
                                     if link_domain == urlparse(url).netloc or self.config.follow_external:
-                                        self.checkpoint.add_url(link, depth=page_depth + 1)
+                                        self._queue_url(link, depth=page_depth + 1)
                             
                             if self._pages_scraped % 10 == 0:
                                 logger.info(f"Progress: {self._pages_scraped} pages scraped")
@@ -1799,6 +1994,8 @@ class DeathStarV2:
                 result_dir = save_forensic_result(forensic_result, self.output_dir / "forensic")
                 results["outputs"]["forensic"] = str(result_dir)
                 results["outputs"]["warc"] = forensic_result.warc_path
+                if forensic_result.cdxj_path:
+                    results["outputs"]["cdxj"] = forensic_result.cdxj_path
                 results["outputs"]["screenshot"] = forensic_result.screenshot_path
                 if forensic_result.mhtml_path:
                     results["outputs"]["mhtml"] = forensic_result.mhtml_path
@@ -1840,7 +2037,7 @@ class DeathStarV2:
                 
                 # Add discovered URLs to queue
                 for discovered_url in list(discovery_result.html_pages)[:self.config.max_pages]:
-                    self.checkpoint.add_url(discovered_url, depth=1)
+                    self._queue_url(discovered_url, depth=1)
                     
             except Exception as e:
                 logger.warning(f"Site discovery failed: {e}")
@@ -1860,6 +2057,8 @@ class DeathStarV2:
                 save_forensic_result(planetary_forensic_result, self.output_dir / "forensic")
                 results["weapons_fired"].append("forensic_capture")
                 results["outputs"]["forensic"] = str(self.output_dir / "forensic")
+                if planetary_forensic_result.cdxj_path:
+                    results["outputs"]["cdxj"] = planetary_forensic_result.cdxj_path
                 if planetary_forensic_result.wacz_path:
                     results["outputs"]["wacz"] = planetary_forensic_result.wacz_path
                 self._pages_scraped += 1
@@ -1928,7 +2127,7 @@ class DeathStarV2:
                                 for link in page.links:
                                     link_domain = urlparse(link).netloc
                                     if link_domain == urlparse(url).netloc:
-                                        self.checkpoint.add_url(link, depth=page_depth + 1)
+                                        self._queue_url(link, depth=page_depth + 1)
                         else:
                             self.checkpoint.mark_failed(page_url, "fetch_failed")
                             self._errors += 1
@@ -2042,6 +2241,8 @@ class DeathStarV2:
                     results["weapons_fired"].append("forensic_capture")
                     results["outputs"]["forensic"] = str(self.output_dir / "forensic")
                     results["outputs"]["warc"] = forensic_result.warc_path
+                    if forensic_result.cdxj_path:
+                        results["outputs"]["cdxj"] = forensic_result.cdxj_path
                     results["outputs"]["har"] = str(self.output_dir / "forensic" / "har")
                     if forensic_result.mhtml_path:
                         results["outputs"]["mhtml"] = forensic_result.mhtml_path
@@ -2099,7 +2300,7 @@ class DeathStarV2:
                     
                     # Add discovered URLs to queue
                     for discovered_url in list(discovery_result.html_pages)[:self.config.max_pages]:
-                        self.checkpoint.add_url(discovered_url, depth=1)
+                        self._queue_url(discovered_url, depth=1)
                         
                 except Exception as e:
                     logger.warning(f"Site discovery failed: {e}")
@@ -2142,7 +2343,7 @@ class DeathStarV2:
                     target_domain = urlparse(url).netloc
                     for link in page_links:
                         if urlparse(link).netloc == target_domain:
-                            self.checkpoint.add_url(link, depth=1)
+                            self._queue_url(link, depth=1)
                     logger.info(f"Seeded {len(page_links)} links from main page into crawl queue")
                 except Exception as e:
                     logger.debug(f"Link extraction from main page failed: {e}")
@@ -2150,7 +2351,7 @@ class DeathStarV2:
                 # Also seed from forensic result internal links if available
                 if forensic_result and hasattr(forensic_result, 'internal_links'):
                     for link in forensic_result.internal_links:
-                        self.checkpoint.add_url(link, depth=1)
+                        self._queue_url(link, depth=1)
                 
             finally:
                 await browser_page.close()
@@ -2212,7 +2413,7 @@ class DeathStarV2:
                                 for link in page.links:
                                     link_domain = urlparse(link).netloc
                                     if link_domain == urlparse(url).netloc:
-                                        self.checkpoint.add_url(link, depth=page_depth + 1)
+                                        self._queue_url(link, depth=page_depth + 1)
                         else:
                             self.checkpoint.mark_failed(page_url, "fetch_failed")
                             self._errors += 1
@@ -2372,8 +2573,28 @@ Examples:
                        help="Generate WACZ package when WARC is available (forensic/planetary/ultimate)")
     parser.add_argument("--block-ads", action="store_true",
                        help="Block known ad/tracker resources in Playwright modes")
+    parser.add_argument("--block-rules-file",
+                       help="Additional regex block rules file (one pattern per line)")
+    parser.add_argument("--behavior-profile", default="archive",
+                       choices=["minimal", "archive", "aggressive"],
+                       help="Playwright behavior profile (default: archive)")
+    parser.add_argument("--wait-until", default="load",
+                       choices=["domcontentloaded", "load", "networkidle", "commit"],
+                       help="Playwright navigation wait state (default: load)")
+    parser.add_argument("--net-idle-wait", type=float, default=2.0,
+                       help="Seconds to wait for networkidle after behaviors (default: 2.0)")
+    parser.add_argument("--auto-click-selector",
+                       help="Optional CSS selector for autoplay/autoclick behavior in Playwright modes")
     parser.add_argument("--save-wayback", action="store_true",
                        help="Submit captured target URL to Internet Archive SavePageNow")
+    parser.add_argument("--include",
+                       help="Regex of URLs to include in crawl scope (Browsertrix-style)")
+    parser.add_argument("--exclude",
+                       help="Regex of URLs to exclude from crawl scope (Browsertrix-style)")
+    parser.add_argument("--ignore-patterns",
+                       help="Regex file for crawl ignores (Grab-site style, one regex per line)")
+    parser.add_argument("--no-global-ignores", action="store_true",
+                       help="Disable built-in global ignore set")
     
     # Proxy and authentication
     parser.add_argument("--proxy", help="Single proxy URL (http://host:port)")
@@ -2422,7 +2643,16 @@ Examples:
         deduplicate=not args.no_dedup,
         generate_wacz=args.wacz,
         block_ads=args.block_ads,
+        block_rules_file=args.block_rules_file,
+        behavior_profile=args.behavior_profile,
+        wait_until=args.wait_until,
+        net_idle_wait=args.net_idle_wait,
+        auto_click_selector=args.auto_click_selector,
         save_to_wayback=args.save_wayback,
+        use_global_ignores=not args.no_global_ignores,
+        ignore_patterns_file=args.ignore_patterns,
+        scope_include_regex=args.include,
+        scope_exclude_regex=args.exclude,
         proxy_list=proxy_list,
         proxy_pool_file=args.proxy_file,
         cookie_file=args.cookies,
