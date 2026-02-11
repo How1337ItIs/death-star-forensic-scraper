@@ -23,12 +23,14 @@ Usage:
     results = await extractor.extract_all(url, html)
 """
 
+import argparse
 import asyncio
 import hashlib
 import json
 import logging
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +38,13 @@ from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urljoin, urlparse
 
 logger = logging.getLogger("media_extractor")
+
+
+def safe_path_component(value: str) -> str:
+    """Make a string safe for cross-platform file and directory names."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (value or "").strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned or "unknown"
 
 
 @dataclass
@@ -148,7 +157,9 @@ class MediaExtractor:
         Returns:
             ExtractionResult with all extracted media
         """
-        domain = urlparse(url).netloc.replace("www.", "")
+        parsed = urlparse(url)
+        domain_raw = (parsed.hostname or parsed.netloc).replace("www.", "")
+        domain = safe_path_component(domain_raw)
         
         videos = []
         audios = []
@@ -586,8 +597,11 @@ class MediaExtractor:
             # Generate filename
             url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
             parsed = urlparse(url)
-            ext = Path(parsed.path).suffix or '.bin'
-            filename = f"{Path(parsed.path).stem[:30]}_{url_hash}{ext}"
+            ext = Path(parsed.path).suffix
+            if not re.fullmatch(r"\.[A-Za-z0-9]{1,8}", ext or ""):
+                ext = '.bin'
+            stem = safe_path_component(Path(parsed.path).stem)[:30]
+            filename = f"{stem}_{url_hash}{ext}"
             filepath = output_dir / filename
             
             # Save file
@@ -636,17 +650,39 @@ async def extract_media_from_url(url: str, html: str = None) -> ExtractionResult
 
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) < 2:
-        print("Usage: python media_extractor.py <url>")
-        sys.exit(1)
-    
-    url = sys.argv[1]
-    
+    def _is_http_url(url: str) -> bool:
+        parsed = urlparse(url)
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+    parser = argparse.ArgumentParser(
+        description="Extract media from a single URL."
+    )
+    parser.add_argument("url", help="Target URL (must include http:// or https://)")
+    parser.add_argument(
+        "--output",
+        "-o",
+        default="data/media",
+        help="Output directory (default: data/media)",
+    )
+    args = parser.parse_args()
+
+    if not _is_http_url(args.url):
+        parser.error("url must include a valid http:// or https:// scheme")
+
     async def main():
-        result = await extract_media_from_url(url)
-        print(f"\n📹 Media Extraction Complete!")
+        try:
+            import httpx
+        except ImportError as exc:
+            raise RuntimeError("httpx is required for standalone media extraction") from exc
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(args.url, follow_redirects=True, timeout=30)
+            response.raise_for_status()
+
+        extractor = MediaExtractor(output_dir=Path(args.output))
+        result = await extractor.extract_all(args.url, response.text)
+
+        print("\nMedia extraction complete")
         print(f"   Source: {result.source_url}")
         print(f"   Videos: {len(result.videos)}")
         print(f"   Audio: {len(result.audios)}")
@@ -654,5 +690,12 @@ if __name__ == "__main__":
         print(f"   Documents: {len(result.documents)}")
         print(f"   Embedded players: {len(result.embedded_players)}")
         print(f"   Total size: {result.total_size / 1024 / 1024:.1f} MB")
-    
-    asyncio.run(main())
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted", file=sys.stderr)
+        sys.exit(130)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)

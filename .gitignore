@@ -1,6 +1,10 @@
 # Output and state
 output/
 data/
+*.log
+
+# Reference repos (clone manually: see REFERENCE_RESEARCH.md)
+reference/
 *.db
 *.db-wal
 *.db-shm

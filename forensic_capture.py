@@ -25,6 +25,7 @@ Usage:
     result = await capture.capture_page(url, browser_page)
 """
 
+import argparse
 import asyncio
 import base64
 import hashlib
@@ -40,8 +41,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import urljoin, urlparse
 import logging
+import sys
 
 logger = logging.getLogger("forensic_capture")
+
+
+def safe_path_component(value: str) -> str:
+    """Make a string safe for cross-platform file and directory names."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (value or "").strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned or "unknown"
 
 
 @dataclass
@@ -172,7 +181,9 @@ class ForensicCapture:
         Returns:
             ForensicResult with all captured data
         """
-        domain = urlparse(url).netloc.replace("www.", "")
+        parsed_target = urlparse(url)
+        domain = (parsed_target.hostname or parsed_target.netloc).replace("www.", "")
+        domain_fs = safe_path_component(domain)
         timestamp = datetime.now().isoformat()
         
         # Reset capture state
@@ -239,7 +250,7 @@ class ForensicCapture:
             asset_hashes = {}
             if capture_assets:
                 assets, asset_hashes = await self._capture_assets(
-                    page, resource_links, domain
+                    page, resource_links, domain_fs
                 )
             
             # Capture certificate
@@ -256,18 +267,18 @@ class ForensicCapture:
             # Screenshot
             screenshot_path = None
             if capture_screenshot:
-                screenshot_path = await self._capture_screenshot(page, domain, timestamp)
+                screenshot_path = await self._capture_screenshot(page, domain_fs, timestamp)
             
             # PDF
             pdf_path = None
             if capture_pdf:
-                pdf_path = await self._capture_pdf(page, domain, timestamp)
+                pdf_path = await self._capture_pdf(page, domain_fs, timestamp)
             
             # Generate HAR
             har_data = {}
             if generate_har:
                 har_data = self._generate_har(url, self._requests, self._responses)
-                har_path = self.output_dir / "har" / f"{domain}_{timestamp.replace(':', '-')}.har"
+                har_path = self.output_dir / "har" / f"{domain_fs}_{timestamp.replace(':', '-')}.har"
                 with open(har_path, 'w') as f:
                     json.dump(har_data, f, indent=2)
             
@@ -275,7 +286,7 @@ class ForensicCapture:
             warc_path = None
             if generate_warc:
                 warc_path = await self._generate_warc(
-                    url, raw_html, self._requests, self._responses, domain, timestamp
+                    url, raw_html, self._requests, self._responses, domain_fs, timestamp
                 )
             
             # Calculate content hash
@@ -595,8 +606,10 @@ class ForensicCapture:
         # Add hash for uniqueness
         url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
         # Get extension
-        ext = Path(path).suffix or '.bin'
-        name = Path(path).stem[:50]
+        ext = Path(path).suffix
+        if not re.fullmatch(r"\.[A-Za-z0-9]{1,8}", ext or ""):
+            ext = '.bin'
+        name = safe_path_component(Path(path).stem)[:50]
         return f"{name}_{url_hash}{ext}"
     
     def _capture_certificate(self, url: str) -> Dict[str, Any]:
@@ -914,7 +927,9 @@ async def capture_url_forensically(
 
 def save_forensic_result(result: ForensicResult, output_dir: Path):
     """Save forensic result to disk."""
-    domain = urlparse(result.url).netloc.replace("www.", "")
+    parsed = urlparse(result.url)
+    domain = (parsed.hostname or parsed.netloc).replace("www.", "")
+    domain = safe_path_component(domain)
     timestamp = result.timestamp.replace(":", "-")
     
     # Create output directory
@@ -978,22 +993,41 @@ def save_forensic_result(result: ForensicResult, output_dir: Path):
 
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) < 2:
-        print("Usage: python forensic_capture.py <url>")
-        sys.exit(1)
-    
-    url = sys.argv[1]
-    
+    def _is_http_url(url: str) -> bool:
+        parsed = urlparse(url)
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+    parser = argparse.ArgumentParser(
+        description="Run a standalone forensic capture for a single URL."
+    )
+    parser.add_argument("url", help="Target URL (must include http:// or https://)")
+    parser.add_argument(
+        "--output",
+        "-o",
+        default="data/forensic",
+        help="Output directory (default: data/forensic)",
+    )
+    args = parser.parse_args()
+
+    if not _is_http_url(args.url):
+        parser.error("url must include a valid http:// or https:// scheme")
+
     async def main():
-        result = await capture_url_forensically(url)
-        save_forensic_result(result, Path("data/forensic"))
-        print(f"\n✅ Forensic capture complete!")
+        result = await capture_url_forensically(args.url, output_dir=args.output)
+        result_dir = save_forensic_result(result, Path(args.output))
+        print("\nForensic capture complete")
         print(f"   URL: {result.url}")
         print(f"   Requests captured: {len(result.requests)}")
         print(f"   Assets captured: {len(result.assets)}")
         print(f"   Screenshot: {result.screenshot_path}")
         print(f"   WARC: {result.warc_path}")
-    
-    asyncio.run(main())
+        print(f"   Output: {result_dir}")
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted", file=sys.stderr)
+        sys.exit(130)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)

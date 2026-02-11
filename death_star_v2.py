@@ -66,6 +66,7 @@ License: MIT
 import argparse
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import random
@@ -137,6 +138,108 @@ def _to_serializable(obj):
     # Catch-all: datetime, httpx.URL, etc.
     return str(obj)
 
+
+def normalize_target_url(url: str) -> str:
+    """Normalize target input to a valid HTTP(S) URL."""
+    def _is_valid_netloc(netloc: str) -> bool:
+        if not netloc or any(ch.isspace() for ch in netloc):
+            return False
+
+        host_port = netloc.rsplit("@", 1)[-1]
+
+        # IPv6 literal: [::1] or [::1]:8443
+        if host_port.startswith("["):
+            if "]" not in host_port:
+                return False
+            host = host_port[1:host_port.index("]")]
+            remainder = host_port[host_port.index("]") + 1:]
+            if remainder:
+                if not remainder.startswith(":"):
+                    return False
+                port = remainder[1:]
+                if not port.isdigit():
+                    return False
+            try:
+                ipaddress.IPv6Address(host)
+                return True
+            except ValueError:
+                return False
+
+        # Split optional port
+        if ":" in host_port:
+            host, port = host_port.rsplit(":", 1)
+            if not port.isdigit():
+                return False
+        else:
+            host = host_port
+
+        if not host:
+            return False
+
+        # IPv4 literal
+        try:
+            ipaddress.IPv4Address(host)
+            return True
+        except ValueError:
+            pass
+
+        if host.lower() == "localhost":
+            return True
+
+        host = host.rstrip(".")
+        if not host or len(host) > 253:
+            return False
+
+        labels = host.split(".")
+        for label in labels:
+            if not label or len(label) > 63:
+                return False
+            if label.startswith("-") or label.endswith("-"):
+                return False
+            if not re.fullmatch(r"[A-Za-z0-9-]+", label):
+                return False
+
+        return True
+
+    raw = (url or "").strip()
+    if not raw:
+        raise ValueError("Target URL is empty")
+
+    parsed = urlparse(raw)
+
+    # Already a valid HTTP(S) URL
+    if parsed.scheme in {"http", "https"}:
+        if not _is_valid_netloc(parsed.netloc):
+            raise ValueError("Target URL is missing a host")
+        return raw
+
+    # Handle host:port shorthand (e.g., localhost:8000)
+    if parsed.scheme and not parsed.netloc and "://" not in raw:
+        normalized = f"https://{raw}"
+        parsed = urlparse(normalized)
+        if not _is_valid_netloc(parsed.netloc):
+            raise ValueError("Target URL is invalid")
+        return normalized
+
+    # Unsupported explicit scheme (ftp:, file:, etc.)
+    if parsed.scheme:
+        raise ValueError(f"Unsupported URL scheme '{parsed.scheme}'. Use http:// or https://")
+
+    # Bare host/domain -> default to HTTPS
+    normalized = f"https://{raw}"
+    parsed = urlparse(normalized)
+    if not _is_valid_netloc(parsed.netloc):
+        raise ValueError("Target URL is invalid")
+
+    return normalized
+
+
+def safe_path_component(value: str) -> str:
+    """Make a string safe for cross-platform file and directory names."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (value or "").strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned or "unknown"
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -207,6 +310,9 @@ class ScrapeConfig:
     save_raw_html: bool = True
     save_screenshots: bool = False
     deduplicate: bool = True
+    generate_wacz: bool = False
+    block_ads: bool = False
+    save_to_wayback: bool = False
     
     # Browser settings
     headless: bool = True
@@ -660,6 +766,16 @@ class EnhancedCheckpoint:
         stats = {row['status']: row['count'] for row in rows}
         stats['total'] = sum(stats.values())
         return stats
+
+    def reset(self):
+        """Clear all checkpoint state for a fresh non-resume run."""
+        self.conn.executescript('''
+            DELETE FROM urls;
+            DELETE FROM content_hashes;
+            DELETE FROM domain_state;
+            DELETE FROM session;
+        ''')
+        self.conn.commit()
     
     def close(self):
         """Close database connection."""
@@ -888,12 +1004,27 @@ class PlaywrightFetcher:
     
     Uses playwright-stealth for anti-bot evasion.
     """
+
+    DEFAULT_BLOCK_RULES = [
+        "doubleclick.net",
+        "googletagmanager.com",
+        "google-analytics.com",
+        "adservice.google.com",
+        "adsystem.com",
+        "ads-twitter.com",
+        "facebook.net/tr",
+        "hotjar.com",
+        "segment.com",
+        "optimizely.com",
+    ]
     
     def __init__(self, config: ScrapeConfig):
         self.config = config
         self._browser = None
         self._context = None
         self._playwright = None
+        self._block_rules_installed = False
+        self._blocked_request_count = 0
     
     async def _ensure_browser(self):
         """Ensure browser is running."""
@@ -932,6 +1063,7 @@ class PlaywrightFetcher:
             
             # Apply stealth scripts
             await self._apply_stealth()
+            await self._setup_block_rules()
             
         return True
     
@@ -969,6 +1101,25 @@ class PlaywrightFetcher:
         """
         
         await self._context.add_init_script(stealth_js)
+
+    async def _setup_block_rules(self):
+        """Optionally block known tracker/ad resources."""
+        if self._block_rules_installed or not self.config.block_ads:
+            return
+
+        block_terms = [term.lower() for term in self.DEFAULT_BLOCK_RULES]
+
+        async def route_handler(route):
+            request = route.request
+            req_url = request.url.lower()
+            if any(term in req_url for term in block_terms):
+                self._blocked_request_count += 1
+                await route.abort()
+            else:
+                await route.continue_()
+
+        await self._context.route("**/*", route_handler)
+        self._block_rules_installed = True
     
     async def fetch(self, url: str) -> Optional[ScrapedPage]:
         """Fetch page with stealth browser."""
@@ -977,6 +1128,7 @@ class PlaywrightFetcher:
         
         page = None
         try:
+            blocked_start = self._blocked_request_count
             page = await self._context.new_page()
             
             # Navigate: use 'load' to get DOM + resources without waiting for network idle (mirror.xyz etc.)
@@ -1043,7 +1195,9 @@ class PlaywrightFetcher:
                 media=media,
                 metadata={
                     "screenshot": screenshot_data is not None,
-                    "js_rendered": True
+                    "js_rendered": True,
+                    "blocked_requests": self._blocked_request_count - blocked_start,
+                    "block_rules_enabled": self.config.block_ads,
                 },
                 scraped_at=datetime.now().isoformat(),
                 method="playwright",
@@ -1112,7 +1266,7 @@ class WgetFetcher:
             return None
         
         domain = urlparse(url).netloc.replace("www.", "")
-        output_path = self.output_dir / "wget" / domain
+        output_path = self.output_dir / "wget" / safe_path_component(domain)
         output_path.mkdir(parents=True, exist_ok=True)
         
         logger.info(f"🌐 WGET: Downloading {url} (depth={self.config.max_depth})")
@@ -1184,7 +1338,7 @@ class ArchiveBoxFetcher:
             return None
         
         domain = urlparse(url).netloc.replace("www.", "")
-        output_path = self.output_dir / "archivebox" / domain
+        output_path = self.output_dir / "archivebox" / safe_path_component(domain)
         output_path.mkdir(parents=True, exist_ok=True)
         
         logger.info(f"📦 ARCHIVEBOX: Archiving {url}")
@@ -1495,18 +1649,30 @@ class DeathStarV2:
         Returns:
             Dict with results and statistics
         """
+        url = normalize_target_url(url)
+
         if depth:
             self.config.max_depth = depth
+
+        # Reset per-target counters/state when reusing the scraper instance.
+        self._pages_scraped = 0
+        self._errors = 0
+        self._shutdown_requested = False
         
         domain = urlparse(url).netloc.replace("www.", "")
+        safe_domain = safe_path_component(domain)
         logger.info(f"DEATH STAR V2 FIRING ON: {url} (mode={mode})")
         
         # Initialize checkpoint
-        self.checkpoint = EnhancedCheckpoint(domain)
+        self.checkpoint = EnhancedCheckpoint(safe_domain)
         
-        # Add seed URL if not resuming or empty
-        stats = self.checkpoint.stats()
-        if not resume or stats.get('total', 0) == 0:
+        # Add seed URL
+        if resume:
+            stats = self.checkpoint.stats()
+            if stats.get('total', 0) == 0:
+                self.checkpoint.add_url(url, depth=0)
+        else:
+            self.checkpoint.reset()
             self.checkpoint.add_url(url, depth=0)
         
         results = {
@@ -1542,7 +1708,7 @@ class DeathStarV2:
             results["weapons_fired"].append("http" if not use_browser else "playwright")
             
             # Process queue
-            output_path = self.output_dir / "pages" / domain
+            output_path = self.output_dir / "pages" / safe_domain
             output_path.mkdir(parents=True, exist_ok=True)
             
             while not self._shutdown_requested:
@@ -1641,7 +1807,10 @@ class DeathStarV2:
                 
             except ImportError as e:
                 logger.error(f"Forensic capture requires additional modules: {e}")
-                results["errors"] = 1
+                self._errors += 1
+            except Exception as e:
+                logger.error(f"Forensic capture failed: {e}")
+                self._errors += 1
         
         elif mode == "planetary":
             # MAXIMUM DESTRUCTION - everything!
@@ -1654,7 +1823,7 @@ class DeathStarV2:
                 discovery = SiteDiscovery(output_dir=self.output_dir / "discovery")
                 discovery_result = await discovery.discover_site(url, max_depth=2)
                 results["weapons_fired"].append("site_discovery")
-                results["outputs"]["discovery"] = str(self.output_dir / "discovery" / domain)
+                results["outputs"]["discovery"] = str(self.output_dir / "discovery" / safe_domain)
                 results["discovery_stats"] = discovery_result.stats
                 
                 # Add discovered URLs to queue
@@ -1707,7 +1876,7 @@ class DeathStarV2:
                 logger.warning(f"Media extraction failed: {e}")
             
             # 4. Full crawl with stealth
-            output_path = self.output_dir / "pages" / domain
+            output_path = self.output_dir / "pages" / safe_domain
             output_path.mkdir(parents=True, exist_ok=True)
             
             while not self._shutdown_requested:
@@ -1805,9 +1974,9 @@ class DeathStarV2:
                         capture_iframes=True,
                         capture_source_maps=True
                     )
-                    advanced.save_result(advanced_result, domain)
+                    advanced.save_result(advanced_result, safe_domain)
                     results["weapons_fired"].append("advanced_capture")
-                    results["outputs"]["advanced"] = str(self.output_dir / "advanced" / domain)
+                    results["outputs"]["advanced"] = str(self.output_dir / "advanced" / safe_domain)
                     results["advanced_stats"] = {
                         "websocket_connections": len(advanced_result.websocket_connections),
                         "websocket_messages": len(advanced_result.websocket_messages),
@@ -1875,9 +2044,9 @@ class DeathStarV2:
                     
                     # Get historical snapshots
                     snapshots = await wayback.get_snapshots(url, limit=100)
-                    wayback.save_snapshots_index(url, snapshots, domain)
+                    wayback.save_snapshots_index(url, snapshots, safe_domain)
                     results["weapons_fired"].append("wayback_integration")
-                    results["outputs"]["wayback"] = str(self.output_dir / "wayback" / domain)
+                    results["outputs"]["wayback"] = str(self.output_dir / "wayback" / safe_domain)
                     results["wayback_stats"] = {
                         "snapshots_found": len(snapshots),
                         "oldest": snapshots[-1].datetime.isoformat() if snapshots else None,
@@ -1899,7 +2068,7 @@ class DeathStarV2:
                     discovery = SiteDiscovery(output_dir=self.output_dir / "discovery")
                     discovery_result = await discovery.discover_site(url, max_depth=2)
                     results["weapons_fired"].append("site_discovery")
-                    results["outputs"]["discovery"] = str(self.output_dir / "discovery" / domain)
+                    results["outputs"]["discovery"] = str(self.output_dir / "discovery" / safe_domain)
                     results["discovery_stats"] = discovery_result.stats
                     
                     # Add discovered URLs to queue
@@ -1961,7 +2130,7 @@ class DeathStarV2:
                 await browser_page.close()
             
             # 6. Full stealth crawl of discovered/linked pages
-            output_path = self.output_dir / "pages" / domain
+            output_path = self.output_dir / "pages" / safe_domain
             output_path.mkdir(parents=True, exist_ok=True)
             
             # Save the main page too
@@ -2052,7 +2221,7 @@ class DeathStarV2:
         results["checkpoint_stats"] = self.checkpoint.stats()
         
         # Save manifest (sanitize for JSON: Path, URL, set, etc.)
-        manifest_path = self.output_dir / f"{domain}_manifest.json"
+        manifest_path = self.output_dir / f"{safe_domain}_manifest.json"
         with open(manifest_path, "w") as f:
             json.dump(_to_serializable(results), f, indent=2, default=str)
         
@@ -2067,6 +2236,7 @@ class DeathStarV2:
         # Create filename from URL
         parsed = urlparse(page.url)
         path_parts = parsed.path.strip('/').replace('/', '_') or 'index'
+        path_parts = safe_path_component(path_parts)
         filename = f"{path_parts}_{page.content_hash}"
         
         # Save JSON metadata + content
@@ -2159,6 +2329,12 @@ Examples:
                        help="Min delay between requests (default: 1.0)")
     parser.add_argument("--no-dedup", action="store_true",
                        help="Disable content deduplication")
+    parser.add_argument("--wacz", action="store_true",
+                       help="Generate WACZ package when WARC is available (forensic/planetary/ultimate)")
+    parser.add_argument("--block-ads", action="store_true",
+                       help="Block known ad/tracker resources in Playwright modes")
+    parser.add_argument("--save-wayback", action="store_true",
+                       help="Submit captured target URL to Internet Archive SavePageNow")
     
     # Proxy and authentication
     parser.add_argument("--proxy", help="Single proxy URL (http://host:port)")
@@ -2191,6 +2367,12 @@ Examples:
     
     # Build config
     proxy_list = [args.proxy] if args.proxy else []
+
+    if args.target:
+        try:
+            args.target = normalize_target_url(args.target)
+        except ValueError as e:
+            parser.error(str(e))
     
     config = ScrapeConfig(
         max_depth=args.depth,
@@ -2199,6 +2381,9 @@ Examples:
         max_delay=args.delay * 2,
         respect_robots=args.polite,
         deduplicate=not args.no_dedup,
+        generate_wacz=args.wacz,
+        block_ads=args.block_ads,
+        save_to_wayback=args.save_wayback,
         proxy_list=proxy_list,
         proxy_pool_file=args.proxy_file,
         cookie_file=args.cookies,
@@ -2215,12 +2400,26 @@ Examples:
         
         try:
             if args.target:
-                result = await death_star.destroy(
-                    args.target,
-                    mode=args.mode,
-                    depth=args.depth,
-                    resume=args.resume
-                )
+                try:
+                    result = await death_star.destroy(
+                        args.target,
+                        mode=args.mode,
+                        depth=args.depth,
+                        resume=args.resume
+                    )
+                except ValueError as e:
+                    result = {
+                        "target": args.target,
+                        "mode": args.mode,
+                        "depth": args.depth,
+                        "started_at": datetime.now().isoformat(),
+                        "weapons_fired": [],
+                        "pages_scraped": 0,
+                        "errors": 1,
+                        "outputs": {},
+                        "completed_at": datetime.now().isoformat(),
+                        "error_message": str(e),
+                    }
                 print(json.dumps(result, indent=2))
                 
             elif args.targets:
@@ -2229,12 +2428,27 @@ Examples:
                 
                 results = []
                 for url in urls:
-                    result = await death_star.destroy(
-                        url,
-                        mode=args.mode,
-                        depth=args.depth,
-                        resume=args.resume
-                    )
+                    try:
+                        normalized_url = normalize_target_url(url)
+                        result = await death_star.destroy(
+                            normalized_url,
+                            mode=args.mode,
+                            depth=args.depth,
+                            resume=args.resume
+                        )
+                    except ValueError as e:
+                        result = {
+                            "target": url,
+                            "mode": args.mode,
+                            "depth": args.depth,
+                            "started_at": datetime.now().isoformat(),
+                            "weapons_fired": [],
+                            "pages_scraped": 0,
+                            "errors": 1,
+                            "outputs": {},
+                            "completed_at": datetime.now().isoformat(),
+                            "error_message": str(e),
+                        }
                     results.append(result)
                 
                 print(json.dumps(results, indent=2))

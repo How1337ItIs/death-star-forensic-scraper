@@ -22,6 +22,7 @@ Usage:
     result = await discovery.discover_site("https://example.com")
 """
 
+import argparse
 import asyncio
 import json
 import logging
@@ -34,8 +35,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 from urllib.robotparser import RobotFileParser
+import sys
 
 logger = logging.getLogger("site_discovery")
+
+
+def safe_path_component(value: str) -> str:
+    """Make a string safe for cross-platform file and directory names."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (value or "").strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned or "unknown"
 
 
 @dataclass
@@ -631,7 +640,7 @@ class SiteDiscovery:
     
     def _save_discovery(self, result: DiscoveryResult, domain: str):
         """Save discovery result to disk."""
-        output_dir = self.output_dir / domain
+        output_dir = self.output_dir / safe_path_component(domain)
         output_dir.mkdir(parents=True, exist_ok=True)
         
         # Save main discovery data
@@ -691,24 +700,64 @@ class SiteDiscovery:
 
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) < 2:
-        print("Usage: python site_discovery.py <url>")
-        sys.exit(1)
-    
-    url = sys.argv[1]
-    
+    def _is_http_url(url: str) -> bool:
+        parsed = urlparse(url)
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+    parser = argparse.ArgumentParser(
+        description="Discover and map a site's structure."
+    )
+    parser.add_argument("url", help="Target URL (must include http:// or https://)")
+    parser.add_argument(
+        "--output",
+        "-o",
+        default="data/discovery",
+        help="Output directory (default: data/discovery)",
+    )
+    parser.add_argument(
+        "--depth",
+        "-d",
+        type=int,
+        default=3,
+        help="Max crawl depth for link discovery (default: 3)",
+    )
+    parser.add_argument(
+        "--no-crawl",
+        action="store_true",
+        help="Disable link crawling and only inspect robots/sitemaps/feeds",
+    )
+    parser.add_argument(
+        "--ignore-robots",
+        action="store_true",
+        help="Do not enforce robots.txt crawl restrictions",
+    )
+    args = parser.parse_args()
+
+    if not _is_http_url(args.url):
+        parser.error("url must include a valid http:// or https:// scheme")
+
     async def main():
-        discovery = SiteDiscovery()
-        result = await discovery.discover_site(url)
-        
-        print(f"\n🔍 Site Discovery Complete!")
+        discovery = SiteDiscovery(output_dir=Path(args.output))
+        result = await discovery.discover_site(
+            args.url,
+            max_depth=args.depth,
+            crawl_for_links=not args.no_crawl,
+            respect_robots=not args.ignore_robots,
+        )
+
+        print("\nSite discovery complete")
         print(f"   Domain: {result.domain}")
         print(f"   Total URLs: {result.stats['total_urls']}")
         print(f"   HTML Pages: {result.stats['html_pages']}")
         print(f"   Sitemaps: {result.stats['sitemaps_found']}")
         print(f"   Feeds: {result.stats['feeds_found']}")
         print(f"   API Endpoints: {result.stats['api_endpoints']}")
-    
-    asyncio.run(main())
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted", file=sys.stderr)
+        sys.exit(130)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)

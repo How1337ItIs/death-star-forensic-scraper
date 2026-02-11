@@ -5,10 +5,16 @@
 requests>=2.28.0
 trafilatura>=1.6.0
 httpx>=0.24.0
+fastapi
+uvicorn
 
 # Browser-based capture (required for forensic / stealth / planetary / ultimate)
 playwright>=1.40.0
 
+# WARC generation (forensic mode) – recommended
+warcio>=2.0.0
+
 # Optional but recommended for full forensic
 # archivebox  # uncomment for ArchiveBox archival mode
 # yt-dlp      # uncomment for video/audio extraction in media_extractor
+# wacz       # uncomment for WACZ export (pip install wacz)

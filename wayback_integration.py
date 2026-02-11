@@ -30,16 +30,26 @@ Usage:
     await wayback.save_url("https://example.com")
 """
 
+import argparse
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse
+import sys
 
 logger = logging.getLogger("wayback_integration")
+
+
+def safe_path_component(value: str) -> str:
+    """Make a string safe for cross-platform file and directory names."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (value or "").strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned or "unknown"
 
 
 @dataclass
@@ -452,7 +462,7 @@ class WaybackMachine:
         domain: str
     ):
         """Save snapshot index to disk."""
-        output_dir = self.output_dir / domain
+        output_dir = self.output_dir / safe_path_component(domain)
         output_dir.mkdir(parents=True, exist_ok=True)
         
         data = {
@@ -512,44 +522,87 @@ async def get_url_history(url: str, years: int = 10) -> List[Dict]:
 
 
 if __name__ == "__main__":
-    import sys
-    
-    if len(sys.argv) < 2:
-        print("Usage: python wayback_integration.py <url> [command]")
-        print("Commands: snapshots, timeline, save, fetch")
-        sys.exit(1)
-    
-    url = sys.argv[1]
-    command = sys.argv[2] if len(sys.argv) > 2 else "snapshots"
-    
+    def _is_http_url(url: str) -> bool:
+        parsed = urlparse(url)
+        return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+    parser = argparse.ArgumentParser(
+        description="Query or submit URLs to the Wayback Machine."
+    )
+    parser.add_argument("url", help="Target URL (must include http:// or https://)")
+    parser.add_argument(
+        "command",
+        nargs="?",
+        choices=["snapshots", "timeline", "save", "fetch"],
+        default="snapshots",
+        help="Operation to run (default: snapshots)",
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        default="data/wayback",
+        help="Output directory (default: data/wayback)",
+    )
+    parser.add_argument(
+        "--years",
+        type=int,
+        default=10,
+        help="Years of history for timeline mode (default: 10)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="Rows to print for snapshots mode (default: 10)",
+    )
+    parser.add_argument(
+        "--timestamp",
+        help="Timestamp for fetch mode (YYYYMMDD or YYYYMMDDhhmmss)",
+    )
+    args = parser.parse_args()
+
+    if not _is_http_url(args.url):
+        parser.error("url must include a valid http:// or https:// scheme")
+
     async def main():
-        wayback = WaybackMachine()
-        
-        if command == "snapshots":
-            snapshots = await wayback.get_snapshots(url)
-            print(f"\n📸 Found {len(snapshots)} snapshots for {url}")
-            for s in snapshots[:10]:
-                print(f"   {s.datetime.strftime('%Y-%m-%d')}: {s.wayback_url}")
-        
-        elif command == "timeline":
-            timeline = await wayback.get_timeline(url)
-            print(f"\n📅 Timeline for {url}")
+        wayback = WaybackMachine(output_dir=Path(args.output))
+
+        if args.command == "snapshots":
+            snapshots = await wayback.get_snapshots(args.url)
+            print(f"\nFound {len(snapshots)} snapshots for {args.url}")
+            for snapshot in snapshots[: max(args.limit, 1)]:
+                print(f"   {snapshot.datetime.strftime('%Y-%m-%d')}: {snapshot.wayback_url}")
+
+        elif args.command == "timeline":
+            timeline = await wayback.get_timeline(args.url, years=args.years)
+            print(f"\nTimeline for {args.url}")
             for year_data in timeline:
                 print(f"   {year_data['year']}: {year_data['snapshots']} snapshots")
-        
-        elif command == "save":
-            result = await wayback.save_url(url)
+
+        elif args.command == "save":
+            result = await wayback.save_url(args.url)
             if result:
-                print(f"✅ Saved to: {result}")
+                print(f"Saved to: {result}")
             else:
-                print("❌ Failed to save")
-        
-        elif command == "fetch":
-            content = await wayback.find_deleted_content(url)
+                print("Failed to save")
+
+        elif args.command == "fetch":
+            if args.timestamp:
+                content = await wayback.fetch_snapshot(args.url, timestamp=args.timestamp)
+            else:
+                content = await wayback.find_deleted_content(args.url)
+
             if content:
-                print(f"✅ Found content from {content.timestamp}")
+                print(f"Found content from {content.timestamp}")
                 print(content.html[:500])
             else:
-                print("❌ No archived content found")
-    
-    asyncio.run(main())
+                print("No archived content found")
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nInterrupted", file=sys.stderr)
+        sys.exit(130)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)

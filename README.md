@@ -1,5 +1,32 @@
 # Death Star Forensic Scraper
 
+**The "Nuke From Orbit" Web Capture Tool.**  
+Full forensic archival of any website. One click. No technical skills required.
+
+---
+
+## 🚀 Easy Start (For Everyone)
+
+**You do not need to use the command line.** We have a Mission Control Dashboard.
+
+### 1. Run the App
+- **Linux/Mac**: Open a terminal and run `./start.sh`
+- **Windows**: Double-click `run_mission_control.bat`
+
+### 2. Use the Dashboard
+1.  **Browser opens automatically** to `http://localhost:8765`.
+2.  **Enter URL**: Type the website you want to capture (e.g., `https://example.com`).
+3.  **Select Mode**:
+    *   **FORENSIC** (Recommended): Captures *everything* on a single page: Screenshots, PDF, Text, Network Traffic (HAR), and Web Archive (WARC).
+    *   **PLANETARY**: Crawls the entire website (use with caution).
+    *   **STEALTH**: For hard-to-scrape sites with bot protection.
+4.  **Click "INITIATE SEQUENCE"**.
+5.  Watch the logs. When finished, click **ARCHIVES** to view and download your files.
+
+---
+
+## 🛠️ Advanced Usage (Developers)
+
 **Full forensic capture of any website.** One command, no config. WARC, HAR, screenshots, DOM, assets, cookies, certificates, and more.
 
 Use for: archival, compliance, research, reverse engineering, or “nuke from orbit” site capture.

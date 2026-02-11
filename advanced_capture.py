@@ -39,6 +39,13 @@ from urllib.parse import urljoin, urlparse
 logger = logging.getLogger("advanced_capture")
 
 
+def safe_path_component(value: str) -> str:
+    """Make a string safe for cross-platform file and directory names."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", (value or "").strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned or "unknown"
+
+
 # =============================================================================
 # DATA CLASSES
 # =============================================================================
@@ -943,7 +950,7 @@ class AdvancedCapture:
     
     def save_result(self, result: AdvancedCaptureResult, domain: str):
         """Save advanced capture result to disk."""
-        output_dir = self.output_dir / domain
+        output_dir = self.output_dir / safe_path_component(domain)
         output_dir.mkdir(parents=True, exist_ok=True)
         
         # Convert to JSON-serializable format
