@@ -9,16 +9,16 @@ import json
 import os
 import subprocess
 import sys
-import glob
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-app = FastAPI(title="Death Star Console", version="2.0")
+app = FastAPI(title="Death Star Console", version="2.1")
 
 # --- Configuration ---
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -48,51 +48,137 @@ class ScrapeRequest(BaseModel):
     max_pages: int = 10000
     delay: float = 1.0
     polite: bool = False
+    wacz: bool = False
+    block_ads: bool = False
+    save_wayback: bool = False
 
 # --- Helper Functions ---
 def find_captures(base_dir: Path) -> List[Dict]:
     """
-    Recursively find all 'metadata.json' files in the output directory
+    Recursively find all 'metadata.json' (forensic) and '*_manifest.json' (crawl) files
     to identify valid capture folders.
     """
-    captures = []
-    # simple walk
-    for root, dirs, files in os.walk(base_dir):
-        if "metadata.json" in files:
-            meta_path = Path(root) / "metadata.json"
+    captures: List[Dict] = []
+    base_resolved = base_dir.resolve()
+
+    def to_static_rel(root: Path, path_val: Optional[str]) -> Optional[str]:
+        if not path_val:
+            return None
+        p = Path(path_val)
+        candidates = [p] if p.is_absolute() else [root / p, base_dir / p, SCRIPT_DIR / p]
+        for candidate in candidates:
             try:
-                with open(meta_path, "r", encoding="utf-8") as f:
+                resolved = candidate.resolve()
+            except Exception:
+                continue
+            if not resolved.exists():
+                continue
+            try:
+                return str(resolved.relative_to(base_resolved))
+            except Exception:
+                continue
+        return None
+
+    # 1. Forensic captures (metadata.json)
+    for root, _, files in os.walk(base_dir):
+        if "metadata.json" not in files:
+            continue
+        root_path = Path(root)
+        meta_path = root_path / "metadata.json"
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            rel_path = root_path.relative_to(base_dir)
+            nested_meta = data.get("metadata", {}) if isinstance(data.get("metadata"), dict) else {}
+
+            assets = {
+                "screenshot": to_static_rel(root_path, data.get("screenshot_path")) or (str(rel_path / "screenshot.png") if (root_path / "screenshot.png").exists() else None),
+                "pdf": to_static_rel(root_path, data.get("pdf_path")) or (str(rel_path / "capture.pdf") if (root_path / "capture.pdf").exists() else None),
+                "warc": to_static_rel(root_path, data.get("warc_path")) or (str(rel_path / "archive.warc.gz") if (root_path / "archive.warc.gz").exists() else None),
+                "wacz": to_static_rel(root_path, data.get("wacz_path")),
+                "mhtml": to_static_rel(root_path, data.get("mhtml_path")),
+                "favicon": to_static_rel(root_path, data.get("favicon_path")),
+                "har": str(rel_path / "network.har") if (root_path / "network.har").exists() else None,
+                "dom": str(rel_path / "dom_snapshot.html") if (root_path / "dom_snapshot.html").exists() else None,
+                "article_html": to_static_rel(root_path, data.get("article_html_path")),
+                "article_txt": to_static_rel(root_path, data.get("article_text_path")),
+            }
+
+            captures.append({
+                "id": str(rel_path),
+                "path": str(rel_path),
+                "timestamp": data.get("timestamp", "Unknown"),
+                "url": data.get("url", "Unknown"),
+                "mode": data.get("mode", "forensic"),
+                "title": data.get("title") or nested_meta.get("title") or "",
+                "stats": data.get("stats") or {
+                    "requests": data.get("requests_count", 0),
+                    "assets": data.get("assets_count", 0),
+                },
+                "assets": assets,
+            })
+        except Exception as e:
+            print(f"Error parsing {meta_path}: {e}")
+
+    # 2. General crawls (*_manifest.json)
+    for root, _, files in os.walk(base_dir):
+        root_path = Path(root)
+        for file in files:
+            if not file.endswith("_manifest.json"):
+                continue
+            manifest_path = root_path / file
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                
-                # Determine relative path for static serving
-                rel_path = Path(root).relative_to(base_dir)
-                
-                # Check for assets
-                assets = {
-                    "screenshot": str(rel_path / "screenshot.png") if (Path(root) / "screenshot.png").exists() else None,
-                    "pdf": str(rel_path / "capture.pdf") if (Path(root) / "capture.pdf").exists() else None,
-                    "warc": str(rel_path / "archive.warc.gz") if (Path(root) / "archive.warc.gz").exists() else None,
-                    "har": str(rel_path / "network.har") if (Path(root) / "network.har").exists() else None,
-                    "dom": str(rel_path / "dom_snapshot.html") if (Path(root) / "dom_snapshot.html").exists() else None,
-                }
+
+                outputs = data.get("outputs", {})
+                assets = {}
+                if isinstance(outputs, dict):
+                    for key, val in outputs.items():
+                        if not isinstance(val, str) or not val:
+                            continue
+                        rel_asset = to_static_rel(root_path, val)
+                        if rel_asset:
+                            assets[key] = rel_asset
 
                 captures.append({
-                    "id": str(rel_path),
-                    "path": str(rel_path),
-                    "timestamp": data.get("timestamp", "Unknown"),
-                    "url": data.get("url", "Unknown"),
-                    "mode": data.get("mode", "unknown"),
-                    "title": data.get("title", ""),
-                    "stats": data.get("stats", {}),
-                    "assets": assets
+                    "id": file,
+                    "path": str(root_path.relative_to(base_dir)),
+                    "timestamp": data.get("started_at", "Unknown"),
+                    "url": data.get("target", "Unknown"),
+                    "mode": data.get("mode", "crawl"),
+                    "title": f"Crawl: {data.get('target')}",
+                    "stats": {"pages": data.get("pages_scraped", 0), "errors": data.get("errors", 0)},
+                    "assets": assets,
                 })
             except Exception as e:
-                print(f"Error parsing {meta_path}: {e}")
-                continue
-    
-    # Sort by timestamp descending (newest first)
-    captures.sort(key=lambda x: x["timestamp"], reverse=True)
-    return captures
+                print(f"Error parsing {manifest_path}: {e}")
+
+    # Deduplicate by timestamp + URL, preferring forensic entries.
+    unique: Dict[str, Dict] = {}
+    for capture in captures:
+        key = f"{capture.get('timestamp')}_{capture.get('url')}"
+        existing = unique.get(key)
+        if existing is None:
+            unique[key] = capture
+            continue
+        if capture.get("mode") == "forensic" and existing.get("mode") != "forensic":
+            unique[key] = capture
+
+    def sort_key(item: Dict) -> float:
+        ts = item.get("timestamp", "")
+        try:
+            parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+            return parsed.timestamp()
+        except Exception:
+            return 0.0
+
+    return sorted(list(unique.values()), key=sort_key, reverse=True)
 
 # --- Endpoints ---
 
@@ -127,8 +213,15 @@ async def run_scrape(req: ScrapeRequest):
         ]
         if req.polite:
             cmd.append("--polite")
+        if req.wacz:
+            cmd.append("--wacz")
+        if req.block_ads:
+            cmd.append("--block-ads")
+        if req.save_wayback:
+            cmd.append("--save-wayback")
 
-        yield f"🚀 Launching Death Star V2...\nCommand: {" ".join(cmd)}\n\n"
+        command_preview = " ".join(cmd)
+        yield f"🚀 Launching Death Star V2...\nCommand: {command_preview}\n\n"
 
         proc = subprocess.Popen(
             cmd,
@@ -192,7 +285,6 @@ def get_html() -> str:
             overflow: hidden;
         }
 
-        /* Sidebar */
         aside {
             width: 260px;
             background: var(--bg-panel);
@@ -239,7 +331,6 @@ def get_html() -> str:
             box-shadow: 0 0 15px var(--accent-glow);
         }
 
-        /* Main Content */
         main {
             flex: 1;
             display: flex;
@@ -260,7 +351,6 @@ def get_html() -> str:
 
         @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
 
-        /* Forms */
         .panel {
             background: var(--bg-panel);
             border: 1px solid var(--border);
@@ -299,6 +389,22 @@ def get_html() -> str:
 
         .row { display: flex; gap: 1rem; }
         .col { flex: 1; }
+        .checkbox-row { flex-wrap: wrap; margin-bottom: 1.5rem; }
+        .checkbox-row label {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin: 0;
+            text-transform: none;
+            letter-spacing: normal;
+            font-size: 0.9rem;
+            color: var(--text-main);
+        }
+        .checkbox-row input[type="checkbox"] {
+            width: auto;
+            padding: 0;
+            accent-color: var(--accent);
+        }
 
         .btn-action {
             width: 100%;
@@ -319,7 +425,6 @@ def get_html() -> str:
         .btn-action:active { transform: scale(0.98); }
         .btn-action:disabled { opacity: 0.5; cursor: wait; }
 
-        /* Terminal Output */
         #terminal {
             background: var(--terminal-bg);
             border: 1px solid var(--border);
@@ -333,7 +438,6 @@ def get_html() -> str:
             border-radius: 4px;
         }
 
-        /* History Grid */
         .history-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
@@ -381,7 +485,6 @@ def get_html() -> str:
             margin-right: 0.5rem;
         }
 
-        /* Modal / Detail View */
         .modal-overlay {
             position: fixed; top: 0; left: 0; right: 0; bottom: 0;
             background: rgba(0,0,0,0.8);
@@ -502,6 +605,12 @@ def get_html() -> str:
                 </div>
             </div>
 
+            <div class="row checkbox-row">
+                <label><input type="checkbox" id="optWacz"> Generate WACZ</label>
+                <label><input type="checkbox" id="optBlockAds"> Block ads/trackers</label>
+                <label><input type="checkbox" id="optWayback"> Save to Wayback</label>
+            </div>
+
             <button class="btn-action" id="launchBtn">INITIATE SEQUENCE</button>
         </div>
 
@@ -545,13 +654,15 @@ def get_html() -> str:
 </div>
 
 <script>
+document.addEventListener('DOMContentLoaded', () => {
+
     // --- STATE ---
     const state = {
         captures: []
     };
 
     // --- NAVIGATION ---
-    function switchView(viewId) {
+    window.switchView = function(viewId) {
         document.querySelectorAll('.view').forEach(el => el.classList.remove('active'));
         document.querySelectorAll('nav button').forEach(el => el.classList.remove('active'));
         
@@ -568,50 +679,62 @@ def get_html() -> str:
     const launchBtn = document.getElementById('launchBtn');
     const terminal = document.getElementById('terminal');
 
-    launchBtn.addEventListener('click', async () => {
-        const url = document.getElementById('targetUrl').value.trim();
-        if (!url) return alert("Target URL required.");
-        
-        launchBtn.disabled = true;
-        launchBtn.textContent = "SEQUENCE RUNNING...";
-        terminal.textContent = "Initializing...\n";
-        
-        const payload = {
-            url,
-            mode: document.getElementById('modeSelect').value,
-            output: document.getElementById('outputDir').value || "output",
-            depth: parseInt(document.getElementById('depth').value),
-            max_pages: parseInt(document.getElementById('maxPages').value)
-        };
+    if (launchBtn) {
+        launchBtn.addEventListener('click', async () => {
+            const url = document.getElementById('targetUrl').value.trim();
+            if (!url) return alert("Target URL required.");
+            
+            console.log("Launching scrape for:", url);
+            launchBtn.disabled = true;
+            launchBtn.textContent = "SEQUENCE RUNNING...";
+            launchBtn.style.opacity = "0.7";
+            terminal.textContent = "Initializing sequence...\n";
+            
+            const payload = {
+                url,
+                mode: document.getElementById('modeSelect').value,
+                output: document.getElementById('outputDir').value || "output",
+                depth: parseInt(document.getElementById('depth').value),
+                max_pages: parseInt(document.getElementById('maxPages').value),
+                wacz: document.getElementById('optWacz').checked,
+                block_ads: document.getElementById('optBlockAds').checked,
+                save_wayback: document.getElementById('optWayback').checked,
+            };
 
-        try {
-            const res = await fetch('/api/run', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(payload)
-            });
-            
-            const reader = res.body.getReader();
-            const dec = new TextDecoder();
-            
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                const chunk = dec.decode(value, {stream: true});
-                terminal.textContent += chunk;
-                terminal.scrollTop = terminal.scrollHeight;
+            try {
+                const res = await fetch('/api/run', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
+                
+                if (!res.ok) throw new Error(`Server returned ${res.status}`);
+
+                const reader = res.body.getReader();
+                const dec = new TextDecoder();
+                
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    const chunk = dec.decode(value, {stream: true});
+                    terminal.textContent += chunk;
+                    terminal.scrollTop = terminal.scrollHeight;
+                }
+            } catch (e) {
+                console.error("Scrape failed:", e);
+                terminal.textContent += `\n[CRITICAL ERROR]: ${e.message}`;
+                alert(`Mission Failed: ${e.message}`);
+            } finally {
+                launchBtn.disabled = false;
+                launchBtn.textContent = "INITIATE SEQUENCE";
+                launchBtn.style.opacity = "1";
+                loadArchives(); 
             }
-        } catch (e) {
-            terminal.textContent += `\n[CRITICAL ERROR]: ${e.message}`;
-        } finally {
-            launchBtn.disabled = false;
-            launchBtn.textContent = "INITIATE SEQUENCE";
-            loadArchives(); // refresh history if they go there
-        }
-    });
+        });
+    }
 
     // --- ACTION: ARCHIVES ---
-    async function loadArchives() {
+    window.loadArchives = async function() {
         const grid = document.getElementById('historyGrid');
         try {
             const res = await fetch('/api/history');
@@ -630,30 +753,38 @@ def get_html() -> str:
                 card.className = 'card';
                 card.onclick = () => openDetail(item);
                 
-                const thumb = item.assets.screenshot ? `/files/${item.assets.screenshot}` : null;
+                let thumb = null;
+                if (item.assets && item.assets.screenshot) {
+                    thumb = `/files/${item.assets.screenshot}`;
+                }
+                
                 const imgHtml = thumb 
                     ? `<img src="${thumb}" loading="lazy">` 
                     : `<div class="placeholder">NO VISUAL</div>`;
+
+                const ts = String(item.timestamp || "Unknown");
+                const tsDate = ts.includes('T') ? ts.split('T')[0] : ts;
 
                 card.innerHTML = `
                     <div class="card-img">${imgHtml}</div>
                     <div class="card-body">
                         <div class="card-title" title="${item.url}">${item.url}</div>
                         <div class="card-meta">
-                            <span>${item.timestamp.split('T')[0]}</span>
-                            <span class="badge">${item.mode.toUpperCase()}</span>
+                            <span>${tsDate}</span>
+                            <span class="badge">${(item.mode || 'unknown').toUpperCase()}</span>
                         </div>
                     </div>
                 `;
                 grid.appendChild(card);
             });
         } catch (e) {
+            console.error("Load archives failed:", e);
             grid.innerHTML = `<div style="color:red">Failed to load archives: ${e.message}</div>`;
         }
     }
 
     // --- MODAL ---
-    function openDetail(item) {
+    window.openDetail = function(item) {
         document.getElementById('modalTitle').textContent = item.url;
         
         // Meta
@@ -666,7 +797,7 @@ def get_html() -> str:
 
         // Preview
         const previewEl = document.getElementById('modalPreview');
-        if (item.assets.screenshot) {
+        if (item.assets && item.assets.screenshot) {
             previewEl.innerHTML = `<img src="/files/${item.assets.screenshot}" class="preview-img">`;
         } else {
             previewEl.innerHTML = `<div style="padding:2rem; border:1px solid var(--border); color:var(--text-dim); text-align:center;">No Screenshot Available</div>`;
@@ -676,25 +807,45 @@ def get_html() -> str:
         const list = document.getElementById('modalAssets');
         list.innerHTML = '';
         
-        const links = [
+        // Standard links
+        const standardLinks = [
             { k: 'dom', l: 'DOM Snapshot (HTML)', i: '📄' },
+            { k: 'article_html', l: 'Article HTML', i: '📰' },
+            { k: 'article_txt', l: 'Article Text', i: '📝' },
             { k: 'pdf', l: 'PDF Capture', i: '📕' },
+            { k: 'mhtml', l: 'MHTML Single File', i: '🧩' },
+            { k: 'favicon', l: 'Favicon', i: '⭐' },
             { k: 'warc', l: 'WARC Archive', i: '📦' },
+            { k: 'wacz', l: 'WACZ Package', i: '🗜️' },
             { k: 'har', l: 'HAR Network Log', i: '🌐' },
         ];
 
-        links.forEach(link => {
-            if (item.assets[link.k]) {
+        if (item.assets) {
+            // Add standard assets
+            standardLinks.forEach(link => {
+                if (item.assets[link.k]) {
+                    const li = document.createElement('li');
+                    li.innerHTML = `<a href="/files/${item.assets[link.k]}" target="_blank">${link.i} ${link.l}</a>`;
+                    list.appendChild(li);
+                }
+            });
+            
+            // Add other assets dynamically
+            for (const [key, val] of Object.entries(item.assets)) {
+                if (standardLinks.some(sl => sl.k === key) || key === 'screenshot') continue;
+                // Avoid showing nulls or non-strings
+                if (!val || typeof val !== 'string') continue;
+                
                 const li = document.createElement('li');
-                li.innerHTML = `<a href="/files/${item.assets[link.k]}" target="_blank">${link.i} ${link.l}</a>`;
+                li.innerHTML = `<a href="/files/${val}" target="_blank">📂 ${key.toUpperCase()}</a>`;
                 list.appendChild(li);
             }
-        });
+        }
 
         document.getElementById('detailModal').classList.add('open');
     }
 
-    function closeModal() {
+    window.closeModal = function() {
         document.getElementById('detailModal').classList.remove('open');
     }
 
@@ -703,6 +854,7 @@ def get_html() -> str:
         if (e.target.id === 'detailModal') closeModal();
     });
 
+});
 </script>
 </body>
 </html>"""

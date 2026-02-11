@@ -51,7 +51,7 @@ playwright install chromium
 python death_star_v2.py --target https://example.com --mode forensic --output ./my-capture
 ```
 
-Output goes to `./my-capture` (or `./output` if you omit `--output`): WARC, HAR, HTML, screenshots, PDF, assets, cookies, TLS certs.
+Output goes to `./my-capture` (or `./output` if you omit `--output`): WARC, HAR, HTML, screenshots, PDF, MHTML single-file snapshot, favicon, assets, cookies, TLS certs.
 
 ---
 
@@ -59,7 +59,7 @@ Output goes to `./my-capture` (or `./output` if you omit `--output`): WARC, HAR,
 
 | Mode       | Use case                    | What you get |
 |-----------|-----------------------------|--------------|
-| **forensic** | One page, full forensics   | WARC, HAR, DOM, assets, storage, certs, screenshot, PDF. **Best for “capture this URL completely.”** |
+| **forensic** | One page, full forensics   | WARC, HAR, DOM, assets, storage, certs, screenshot, PDF, MHTML, favicon, article extraction. **Best for “capture this URL completely.”** |
 | **planetary** | Whole site, maximum      | Discovery + forensic + media + crawl + wget + ArchiveBox (if installed). |
 | **ultimate**  | Everything + extras       | Forensic + WebSockets, forms, tech stack, Wayback, source maps. |
 | **smart**     | Normal crawl (default)    | Adaptive HTTP + browser fallback, markdown + HTML. |
@@ -101,6 +101,15 @@ python death_star_v2.py --target https://your-target.com --mode planetary --outp
 # Delay between requests (seconds)
 --delay N              # default 1.0
 
+# Generate WACZ package from WARC (if `wacz` CLI installed)
+--wacz
+
+# Block known ad/tracker resources in Playwright modes
+--block-ads
+
+# Submit target URL to Internet Archive SavePageNow
+--save-wayback
+
 # Multiple URLs from file
 --targets urls.txt     # one URL per line
 
@@ -127,11 +136,16 @@ output/
         raw.html
         dom_snapshot.html
         clean_text.txt
+        article.html
+        article.txt
         network.har
     warc/          # Web ARChive
     har/            # HTTP Archive
+    wacz/           # ReplayWeb.page compatible package (optional)
     screenshots/
     pdfs/
+    singlefile/     # MHTML snapshots
+    favicons/
     assets/
     certificates/
   data/
@@ -150,6 +164,7 @@ Optional:
 - **wget** – for `quick` and `full`/`planetary` mirroring
 - **ArchiveBox** – for archival mode in `full`/`planetary`
 - **yt-dlp** – for video/audio in media extraction (planetary/ultimate)
+- **wacz** – for WACZ output (`--wacz`) from forensic captures
 
 ---
 

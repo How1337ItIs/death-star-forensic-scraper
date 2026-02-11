@@ -1788,15 +1788,24 @@ class DeathStarV2:
                     capture_storage=True,
                     capture_screenshot=True,
                     capture_pdf=True,
+                    capture_mhtml=True,
+                    capture_favicon=True,
                     capture_certificate=True,
                     generate_warc=True,
                     generate_har=True,
+                    generate_wacz=self.config.generate_wacz,
                 )
                 
                 result_dir = save_forensic_result(forensic_result, self.output_dir / "forensic")
                 results["outputs"]["forensic"] = str(result_dir)
                 results["outputs"]["warc"] = forensic_result.warc_path
                 results["outputs"]["screenshot"] = forensic_result.screenshot_path
+                if forensic_result.mhtml_path:
+                    results["outputs"]["mhtml"] = forensic_result.mhtml_path
+                if forensic_result.favicon_path:
+                    results["outputs"]["favicon"] = forensic_result.favicon_path
+                if forensic_result.wacz_path:
+                    results["outputs"]["wacz"] = forensic_result.wacz_path
                 results["forensic_stats"] = {
                     "requests_captured": len(forensic_result.requests),
                     "assets_captured": len(forensic_result.assets),
@@ -1804,13 +1813,16 @@ class DeathStarV2:
                     "local_storage_keys": len(forensic_result.local_storage),
                 }
                 self._pages_scraped = 1
+                self.checkpoint.mark_complete(url, "forensic_capture", forensic_result.content_hash)
                 
             except ImportError as e:
                 logger.error(f"Forensic capture requires additional modules: {e}")
                 self._errors += 1
+                self.checkpoint.mark_failed(url, str(e))
             except Exception as e:
                 logger.error(f"Forensic capture failed: {e}")
                 self._errors += 1
+                self.checkpoint.mark_failed(url, str(e))
         
         elif mode == "planetary":
             # MAXIMUM DESTRUCTION - everything!
@@ -1841,10 +1853,15 @@ class DeathStarV2:
                 )
                 
                 forensic = ForensicCapture(output_dir=self.output_dir / "forensic")
-                planetary_forensic_result = await forensic.capture_page(url)
+                planetary_forensic_result = await forensic.capture_page(
+                    url,
+                    generate_wacz=self.config.generate_wacz,
+                )
                 save_forensic_result(planetary_forensic_result, self.output_dir / "forensic")
                 results["weapons_fired"].append("forensic_capture")
                 results["outputs"]["forensic"] = str(self.output_dir / "forensic")
+                if planetary_forensic_result.wacz_path:
+                    results["outputs"]["wacz"] = planetary_forensic_result.wacz_path
                 self._pages_scraped += 1
                 
             except Exception as e:
@@ -2014,15 +2031,24 @@ class DeathStarV2:
                         capture_storage=True,
                         capture_screenshot=True,
                         capture_pdf=True,
+                        capture_mhtml=True,
+                        capture_favicon=True,
                         capture_certificate=True,
                         generate_warc=True,
-                        generate_har=True
+                        generate_har=True,
+                        generate_wacz=self.config.generate_wacz,
                     )
                     save_forensic_result(forensic_result, self.output_dir / "forensic")
                     results["weapons_fired"].append("forensic_capture")
                     results["outputs"]["forensic"] = str(self.output_dir / "forensic")
                     results["outputs"]["warc"] = forensic_result.warc_path
                     results["outputs"]["har"] = str(self.output_dir / "forensic" / "har")
+                    if forensic_result.mhtml_path:
+                        results["outputs"]["mhtml"] = forensic_result.mhtml_path
+                    if forensic_result.favicon_path:
+                        results["outputs"]["favicon"] = forensic_result.favicon_path
+                    if forensic_result.wacz_path:
+                        results["outputs"]["wacz"] = forensic_result.wacz_path
                     results["forensic_stats"] = {
                         "requests_captured": len(forensic_result.requests),
                         "responses_captured": len(forensic_result.responses),
@@ -2213,6 +2239,19 @@ class DeathStarV2:
                     results["outputs"]["archivebox"] = str(ab_path)
             
             logger.info("ULTIMATE DESTRUCTION COMPLETE - NOTHING REMAINS")
+
+        # Optional SavePageNow submission for non-ultimate modes.
+        if self.config.save_to_wayback and mode != "ultimate":
+            try:
+                WaybackMachine = _import_core('wayback_integration', 'WaybackMachine')
+                wayback = WaybackMachine(output_dir=self.output_dir / "wayback")
+                archived_url = await wayback.save_url(url, capture_all=True)
+                results["weapons_fired"].append("wayback_save")
+                results["wayback_submission"] = archived_url
+                if archived_url:
+                    results["outputs"]["wayback_submission"] = str(archived_url)
+            except Exception as e:
+                logger.warning(f"Wayback save submission failed: {e}")
         
         # Finalize results
         results["pages_scraped"] = self._pages_scraped
@@ -2476,6 +2515,12 @@ Optional Tools:
 # ArchiveBox (full archival)
 pip install archivebox
 archivebox init --setup
+
+# WACZ output (ReplayWeb.page compatible packages)
+pip install wacz
+
+# Better article extraction (optional)
+pip install readability-lxml
 
 # wget (usually pre-installed on Linux)
 sudo apt install wget  # Ubuntu/Debian

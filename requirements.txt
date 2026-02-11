@@ -18,3 +18,4 @@ warcio>=2.0.0
 # archivebox  # uncomment for ArchiveBox archival mode
 # yt-dlp      # uncomment for video/audio extraction in media_extractor
 # wacz       # uncomment for WACZ export (pip install wacz)
+# readability-lxml  # optional higher-quality article extraction in forensic output

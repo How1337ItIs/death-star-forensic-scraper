@@ -32,8 +32,10 @@ import hashlib
 import io
 import json
 import re
+import shutil
 import socket
 import ssl
+import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -117,6 +119,8 @@ class ForensicResult:
     # Visual
     screenshot_path: Optional[str]
     pdf_path: Optional[str]
+    mhtml_path: Optional[str]
+    favicon_path: Optional[str]
     
     # Links & Structure
     internal_links: List[str]
@@ -126,6 +130,7 @@ class ForensicResult:
     # Hashes for integrity
     content_hash: str
     warc_path: Optional[str]
+    wacz_path: Optional[str]
 
 
 class ForensicCapture:
@@ -146,6 +151,9 @@ class ForensicCapture:
         (self.output_dir / "assets").mkdir(exist_ok=True)
         (self.output_dir / "screenshots").mkdir(exist_ok=True)
         (self.output_dir / "pdfs").mkdir(exist_ok=True)
+        (self.output_dir / "singlefile").mkdir(exist_ok=True)
+        (self.output_dir / "favicons").mkdir(exist_ok=True)
+        (self.output_dir / "wacz").mkdir(exist_ok=True)
         (self.output_dir / "metadata").mkdir(exist_ok=True)
         (self.output_dir / "certificates").mkdir(exist_ok=True)
         
@@ -160,9 +168,12 @@ class ForensicCapture:
         capture_storage: bool = True,
         capture_screenshot: bool = True,
         capture_pdf: bool = True,
+        capture_mhtml: bool = True,
+        capture_favicon: bool = True,
         capture_certificate: bool = True,
         generate_warc: bool = True,
         generate_har: bool = True,
+        generate_wacz: bool = False,
     ) -> ForensicResult:
         """
         Capture complete forensic data for a page.
@@ -174,9 +185,12 @@ class ForensicCapture:
             capture_storage: Capture browser storage
             capture_screenshot: Take screenshot
             capture_pdf: Generate PDF
+            capture_mhtml: Generate MHTML single-file snapshot
+            capture_favicon: Download and save site favicon
             capture_certificate: Capture SSL certificate
             generate_warc: Generate WARC archive
             generate_har: Generate HAR file
+            generate_wacz: Convert generated WARC into WACZ (requires `wacz` CLI)
         
         Returns:
             ForensicResult with all captured data
@@ -224,6 +238,18 @@ class ForensicCapture:
             
             # Capture metadata
             metadata = await self._extract_metadata(page, raw_html, url)
+
+            # Capture favicon
+            favicon_path = None
+            if capture_favicon:
+                favicon_path = await self._capture_favicon(
+                    url=url,
+                    domain=domain_fs,
+                    timestamp=timestamp,
+                    metadata=metadata,
+                )
+                if favicon_path:
+                    metadata["favicon_path"] = favicon_path
             
             # Capture headers
             headers = {}
@@ -273,6 +299,11 @@ class ForensicCapture:
             pdf_path = None
             if capture_pdf:
                 pdf_path = await self._capture_pdf(page, domain_fs, timestamp)
+
+            # Single-file (MHTML) snapshot
+            mhtml_path = None
+            if capture_mhtml:
+                mhtml_path = await self._capture_mhtml(page, domain_fs, timestamp)
             
             # Generate HAR
             har_data = {}
@@ -287,6 +318,16 @@ class ForensicCapture:
             if generate_warc:
                 warc_path = await self._generate_warc(
                     url, raw_html, self._requests, self._responses, domain_fs, timestamp
+                )
+
+            # Generate WACZ from WARC if requested
+            wacz_path = None
+            if generate_wacz and warc_path:
+                wacz_path = await self._generate_wacz(
+                    warc_path=warc_path,
+                    source_url=url,
+                    domain=domain_fs,
+                    timestamp=timestamp,
                 )
             
             # Calculate content hash
@@ -315,11 +356,14 @@ class ForensicCapture:
                 security_headers=security_headers,
                 screenshot_path=screenshot_path,
                 pdf_path=pdf_path,
+                mhtml_path=mhtml_path,
+                favicon_path=favicon_path,
                 internal_links=internal_links,
                 external_links=external_links,
                 resource_links=resource_links,
                 content_hash=content_hash,
-                warc_path=warc_path
+                warc_path=warc_path,
+                wacz_path=wacz_path,
             )
             
         finally:
@@ -713,6 +757,126 @@ class ForensicCapture:
         except Exception as e:
             logger.debug(f"PDF generation failed: {e}")
             return None
+
+    async def _capture_mhtml(self, page, domain: str, timestamp: str) -> Optional[str]:
+        """Capture a single-file MHTML snapshot via CDP."""
+        filename = f"{domain}_{timestamp.replace(':', '-')}.mhtml"
+        filepath = self.output_dir / "singlefile" / filename
+
+        try:
+            cdp_session = await page.context.new_cdp_session(page)
+            snapshot = await cdp_session.send("Page.captureSnapshot", {"format": "mhtml"})
+            mhtml_data = snapshot.get("data", "")
+            if not mhtml_data:
+                return None
+
+            with open(filepath, "w", encoding="utf-8", errors="ignore") as f:
+                f.write(mhtml_data)
+            return str(filepath)
+        except Exception as e:
+            logger.debug(f"MHTML capture failed: {e}")
+            return None
+
+    async def _capture_favicon(
+        self,
+        url: str,
+        domain: str,
+        timestamp: str,
+        metadata: Dict[str, Any],
+    ) -> Optional[str]:
+        """Download favicon referenced by page metadata or common default paths."""
+        try:
+            import requests
+        except ImportError:
+            return None
+
+        parsed = urlparse(url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+        candidates: List[str] = []
+
+        favicon_hint = metadata.get("favicon")
+        if favicon_hint:
+            candidates.append(urljoin(url, favicon_hint))
+
+        candidates.extend([
+            urljoin(base_url, "/favicon.ico"),
+            urljoin(base_url, "/favicon.png"),
+            urljoin(base_url, "/apple-touch-icon.png"),
+        ])
+
+        seen = set()
+        ordered_candidates = []
+        for candidate in candidates:
+            if candidate and candidate not in seen:
+                ordered_candidates.append(candidate)
+                seen.add(candidate)
+
+        for favicon_url in ordered_candidates:
+            try:
+                response = requests.get(favicon_url, timeout=15)
+                if response.status_code != 200 or not response.content:
+                    continue
+
+                ext = Path(urlparse(favicon_url).path).suffix.lower()
+                if not re.fullmatch(r"\.[a-z0-9]{1,8}", ext or ""):
+                    content_type = response.headers.get("content-type", "").lower()
+                    ext = ".png" if "png" in content_type else ".ico"
+
+                filename = f"{domain}_{timestamp.replace(':', '-')}{ext}"
+                filepath = self.output_dir / "favicons" / filename
+                with open(filepath, "wb") as f:
+                    f.write(response.content)
+
+                return str(filepath)
+            except Exception:
+                continue
+
+        return None
+
+    async def _generate_wacz(
+        self,
+        warc_path: str,
+        source_url: str,
+        domain: str,
+        timestamp: str,
+    ) -> Optional[str]:
+        """Generate a WACZ package from a WARC file using py-wacz CLI."""
+        if not warc_path or not warc_path.endswith((".warc", ".warc.gz")):
+            return None
+
+        if shutil.which("wacz") is None:
+            logger.warning("wacz CLI not found; skipping WACZ generation")
+            return None
+
+        output_path = self.output_dir / "wacz" / f"{domain}_{timestamp.replace(':', '-')}.wacz"
+        cmd = [
+            "wacz",
+            "create",
+            warc_path,
+            "-o",
+            str(output_path),
+            "--detect-pages",
+            "--url",
+            source_url,
+            "--title",
+            domain,
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if result.returncode == 0 and output_path.exists():
+                return str(output_path)
+
+            logger.warning(f"WACZ generation failed (exit={result.returncode}): {result.stderr[:300]}")
+            return None
+        except Exception as e:
+            logger.warning(f"WACZ generation failed: {e}")
+            return None
     
     def _generate_har(
         self,
@@ -903,13 +1067,73 @@ class ForensicCapture:
         return str(filepath)
 
 
+def extract_article_content(html: str) -> Dict[str, Optional[str]]:
+    """Extract readable article-oriented content using optional extractors."""
+    result = {
+        "method": None,
+        "title": None,
+        "html": None,
+        "text": None,
+    }
+
+    # 1) Prefer readability-lxml when installed.
+    try:
+        from readability import Document
+
+        doc = Document(html)
+        article_html = doc.summary(html_partial=True)
+        article_title = (doc.short_title() or "").strip() or None
+        article_text = re.sub(r"<[^>]+>", " ", article_html)
+        article_text = re.sub(r"\s+", " ", article_text).strip()
+
+        if article_html and article_text:
+            result.update({
+                "method": "readability-lxml",
+                "title": article_title,
+                "html": article_html,
+                "text": article_text,
+            })
+            return result
+    except Exception:
+        pass
+
+    # 2) Fallback to trafilatura when available.
+    try:
+        import trafilatura
+
+        article_text = trafilatura.extract(
+            html,
+            include_links=False,
+            include_images=False,
+            include_tables=True,
+        )
+        article_html = trafilatura.extract(
+            html,
+            output_format="html",
+            include_links=True,
+            include_images=False,
+        )
+        if article_text:
+            result.update({
+                "method": "trafilatura",
+                "html": article_html,
+                "text": article_text,
+            })
+            return result
+    except Exception:
+        pass
+
+    return result
+
+
 # =============================================================================
 # STANDALONE FUNCTIONS
 # =============================================================================
 
 async def capture_url_forensically(
     url: str,
-    output_dir: str = "data/forensic"
+    output_dir: str = "data/forensic",
+    generate_wacz: bool = False,
 ) -> ForensicResult:
     """
     Convenience function to forensically capture a URL.
@@ -922,7 +1146,7 @@ async def capture_url_forensically(
         ForensicResult with all captured data
     """
     capture = ForensicCapture(output_dir=Path(output_dir))
-    return await capture.capture_page(url)
+    return await capture.capture_page(url, generate_wacz=generate_wacz)
 
 
 def save_forensic_result(result: ForensicResult, output_dir: Path):
@@ -936,6 +1160,18 @@ def save_forensic_result(result: ForensicResult, output_dir: Path):
     result_dir = output_dir / "results" / f"{domain}_{timestamp}"
     result_dir.mkdir(parents=True, exist_ok=True)
     
+    article = extract_article_content(result.raw_html)
+    article_html_path = None
+    article_text_path = None
+    if article.get("html"):
+        article_html_path = str(result_dir / "article.html")
+        with open(result_dir / "article.html", "w", encoding="utf-8") as f:
+            f.write(article["html"])
+    if article.get("text"):
+        article_text_path = str(result_dir / "article.txt")
+        with open(result_dir / "article.txt", "w", encoding="utf-8") as f:
+            f.write(article["text"])
+
     # Save metadata
     metadata = {
         "url": result.url,
@@ -956,7 +1192,14 @@ def save_forensic_result(result: ForensicResult, output_dir: Path):
         "requests_count": len(result.requests),
         "screenshot_path": result.screenshot_path,
         "pdf_path": result.pdf_path,
+        "mhtml_path": result.mhtml_path,
+        "favicon_path": result.favicon_path,
         "warc_path": result.warc_path,
+        "wacz_path": result.wacz_path,
+        "article_extraction_method": article.get("method"),
+        "article_title": article.get("title"),
+        "article_html_path": article_html_path,
+        "article_text_path": article_text_path,
     }
     
     with open(result_dir / "metadata.json", "w") as f:
@@ -1007,13 +1250,22 @@ if __name__ == "__main__":
         default="data/forensic",
         help="Output directory (default: data/forensic)",
     )
+    parser.add_argument(
+        "--wacz",
+        action="store_true",
+        help="Generate WACZ package when warc and wacz CLI are available",
+    )
     args = parser.parse_args()
 
     if not _is_http_url(args.url):
         parser.error("url must include a valid http:// or https:// scheme")
 
     async def main():
-        result = await capture_url_forensically(args.url, output_dir=args.output)
+        result = await capture_url_forensically(
+            args.url,
+            output_dir=args.output,
+            generate_wacz=args.wacz,
+        )
         result_dir = save_forensic_result(result, Path(args.output))
         print("\nForensic capture complete")
         print(f"   URL: {result.url}")
@@ -1021,6 +1273,10 @@ if __name__ == "__main__":
         print(f"   Assets captured: {len(result.assets)}")
         print(f"   Screenshot: {result.screenshot_path}")
         print(f"   WARC: {result.warc_path}")
+        if result.wacz_path:
+            print(f"   WACZ: {result.wacz_path}")
+        if result.mhtml_path:
+            print(f"   MHTML: {result.mhtml_path}")
         print(f"   Output: {result_dir}")
 
     try:
