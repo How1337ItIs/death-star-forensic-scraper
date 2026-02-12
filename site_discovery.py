@@ -147,6 +147,8 @@ class SiteDiscovery:
         max_depth: int = 3,
         crawl_for_links: bool = True,
         respect_robots: bool = True,
+        max_pages: int = 200,
+        max_urls: int = 5000,
     ) -> DiscoveryResult:
         """
         Discover complete site structure.
@@ -213,12 +215,17 @@ class SiteDiscovery:
         external_links = defaultdict(list)
         depth_map = {url: 0}
         
-        # Crawl for links if enabled
+        # Crawl for links if enabled (bounded to avoid runaway on large sites)
         if crawl_for_links:
             crawled = set()
             to_crawl = [(url, 0)]
             
             while to_crawl:
+                if max_pages and len(crawled) >= max_pages:
+                    break
+                if max_urls and len(all_urls) >= max_urls:
+                    break
+
                 current_url, depth = to_crawl.pop(0)
                 
                 if current_url in crawled:
@@ -242,9 +249,10 @@ class SiteDiscovery:
                             # Internal link
                             internal_links[current_url].append(link)
                             edges.append((current_url, link))
-                            all_urls.add(link)
+                            if not max_urls or len(all_urls) < max_urls:
+                                all_urls.add(link)
                             
-                            if link not in crawled and link not in [u for u, _ in to_crawl]:
+                            if (not max_pages or len(crawled) < max_pages) and link not in crawled and link not in [u for u, _ in to_crawl]:
                                 to_crawl.append((link, depth + 1))
                                 depth_map[link] = depth + 1
                         else:
@@ -731,6 +739,18 @@ if __name__ == "__main__":
         action="store_true",
         help="Do not enforce robots.txt crawl restrictions",
     )
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=200,
+        help="Hard cap for pages crawled during discovery (default: 200)",
+    )
+    parser.add_argument(
+        "--max-urls",
+        type=int,
+        default=5000,
+        help="Hard cap for total URLs tracked during discovery (default: 5000)",
+    )
     args = parser.parse_args()
 
     if not _is_http_url(args.url):
@@ -743,6 +763,8 @@ if __name__ == "__main__":
             max_depth=args.depth,
             crawl_for_links=not args.no_crawl,
             respect_robots=not args.ignore_robots,
+            max_pages=args.max_pages,
+            max_urls=args.max_urls,
         )
 
         print("\nSite discovery complete")

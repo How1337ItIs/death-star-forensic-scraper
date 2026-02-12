@@ -123,6 +123,10 @@ python death_star_v2.py --target https://your-target.com --mode planetary --outp
 --ignore-patterns config/ignore_sets/grabsite_global_minimal.regex
 --no-global-ignores
 
+# Bound site discovery in planetary/ultimate mode
+--discovery-max-pages 200
+--discovery-max-urls 5000
+
 # Multiple URLs from file
 --targets urls.txt     # one URL per line
 

@@ -333,6 +333,8 @@ class ScrapeConfig:
     net_idle_wait: float = 2.0
     auto_click_selector: Optional[str] = None
     block_rules_file: Optional[str] = None
+    discovery_max_pages: int = 200
+    discovery_max_urls: int = 5000
     
     # Proxy settings
     proxy_list: List[str] = field(default_factory=list)
@@ -1906,6 +1908,7 @@ class DeathStarV2:
             output_path = self.output_dir / "pages" / safe_domain
             output_path.mkdir(parents=True, exist_ok=True)
             
+            reached_limit = False
             while not self._shutdown_requested:
                 pending = self.checkpoint.get_pending(limit=10)
                 if not pending:
@@ -1917,6 +1920,7 @@ class DeathStarV2:
                     
                     if self._pages_scraped >= self.config.max_pages:
                         logger.info(f"Reached max pages limit: {self.config.max_pages}")
+                        reached_limit = True
                         break
                     
                     page_url = item['url']
@@ -1957,6 +1961,9 @@ class DeathStarV2:
                         logger.error(f"Error scraping {page_url}: {e}")
                         self.checkpoint.mark_failed(page_url, str(e))
                         self._errors += 1
+
+                if reached_limit:
+                    break
             
             results["outputs"]["pages"] = str(output_path)
             
@@ -2030,7 +2037,12 @@ class DeathStarV2:
                 SiteDiscovery = _import_core('site_discovery', 'SiteDiscovery')
                 
                 discovery = SiteDiscovery(output_dir=self.output_dir / "discovery")
-                discovery_result = await discovery.discover_site(url, max_depth=2)
+                discovery_result = await discovery.discover_site(
+                    url,
+                    max_depth=2,
+                    max_pages=self.config.discovery_max_pages,
+                    max_urls=self.config.discovery_max_urls,
+                )
                 results["weapons_fired"].append("site_discovery")
                 results["outputs"]["discovery"] = str(self.output_dir / "discovery" / safe_domain)
                 results["discovery_stats"] = discovery_result.stats
@@ -2135,6 +2147,9 @@ class DeathStarV2:
                     except Exception as e:
                         self.checkpoint.mark_failed(page_url, str(e))
                         self._errors += 1
+
+                if self._pages_scraped >= self.config.max_pages:
+                    break
             
             results["weapons_fired"].append("stealth_crawl")
             results["outputs"]["pages"] = str(output_path)
@@ -2293,7 +2308,12 @@ class DeathStarV2:
                     SiteDiscovery = _import_core('site_discovery', 'SiteDiscovery')
                     
                     discovery = SiteDiscovery(output_dir=self.output_dir / "discovery")
-                    discovery_result = await discovery.discover_site(url, max_depth=2)
+                    discovery_result = await discovery.discover_site(
+                        url,
+                        max_depth=2,
+                        max_pages=self.config.discovery_max_pages,
+                        max_urls=self.config.discovery_max_urls,
+                    )
                     results["weapons_fired"].append("site_discovery")
                     results["outputs"]["discovery"] = str(self.output_dir / "discovery" / safe_domain)
                     results["discovery_stats"] = discovery_result.stats
@@ -2421,6 +2441,9 @@ class DeathStarV2:
                     except Exception as e:
                         self.checkpoint.mark_failed(page_url, str(e))
                         self._errors += 1
+
+                if self._pages_scraped >= self.config.max_pages:
+                    break
             
             results["weapons_fired"].append("stealth_crawl")
             results["outputs"]["pages"] = str(output_path)
@@ -2595,6 +2618,10 @@ Examples:
                        help="Regex file for crawl ignores (Grab-site style, one regex per line)")
     parser.add_argument("--no-global-ignores", action="store_true",
                        help="Disable built-in global ignore set")
+    parser.add_argument("--discovery-max-pages", type=int, default=200,
+                       help="Max pages for site_discovery phase in planetary/ultimate (default: 200)")
+    parser.add_argument("--discovery-max-urls", type=int, default=5000,
+                       help="Max total URLs tracked in site_discovery (default: 5000)")
     
     # Proxy and authentication
     parser.add_argument("--proxy", help="Single proxy URL (http://host:port)")
@@ -2653,6 +2680,8 @@ Examples:
         ignore_patterns_file=args.ignore_patterns,
         scope_include_regex=args.include,
         scope_exclude_regex=args.exclude,
+        discovery_max_pages=args.discovery_max_pages,
+        discovery_max_urls=args.discovery_max_urls,
         proxy_list=proxy_list,
         proxy_pool_file=args.proxy_file,
         cookie_file=args.cookies,
