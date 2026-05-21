@@ -4,14 +4,13 @@ Death Star Forensic Scraper - Command Console
 Run: uvicorn dashboard:app --reload --host 0.0.0.0 --port 8765
 Access: http://localhost:8765
 """
-import asyncio
 import json
 import os
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -51,6 +50,13 @@ class ScrapeRequest(BaseModel):
     wacz: bool = False
     block_ads: bool = False
     save_wayback: bool = False
+    engine: str = "auto"
+    crawl_backend: str = "native"
+    archive_backend: str = "native"
+    include: Optional[str] = None
+    exclude: Optional[str] = None
+    headed: bool = False
+    cdp: Optional[str] = None
 
 # --- Helper Functions ---
 def find_captures(base_dir: Path) -> List[Dict]:
@@ -121,11 +127,11 @@ def find_captures(base_dir: Path) -> List[Dict]:
         except Exception as e:
             print(f"Error parsing {meta_path}: {e}")
 
-    # 2. General crawls (*_manifest.json)
+    # 2. General crawls (manifest.json and legacy *_manifest.json)
     for root, _, files in os.walk(base_dir):
         root_path = Path(root)
         for file in files:
-            if not file.endswith("_manifest.json"):
+            if file != "manifest.json" and not file.endswith("_manifest.json"):
                 continue
             manifest_path = root_path / file
             try:
@@ -190,11 +196,20 @@ def index():
 def get_history():
     return find_captures(DEFAULT_OUTPUT_DIR)
 
+@app.get("/api/doctor")
+def get_doctor():
+    src_dir = SCRIPT_DIR / "src"
+    if str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
+    from scraping.core.backends import get_backend_report
+
+    return get_backend_report()
+
 @app.post("/api/run")
 async def run_scrape(req: ScrapeRequest):
     if not req.url:
         raise HTTPException(status_code=400, detail="URL is required")
-    
+
     # Validate mode
     if req.mode not in [m[0] for m in MODES]:
         req.mode = "forensic"
@@ -203,7 +218,8 @@ async def run_scrape(req: ScrapeRequest):
         # Construct command
         cmd = [
             sys.executable,
-            str(SCRIPT_DIR / "death_star_v2.py"),
+            "-m",
+            "scraping.core.death_star_v2",
             "--target", req.url,
             "--mode", req.mode,
             "--output", req.output,
@@ -219,19 +235,39 @@ async def run_scrape(req: ScrapeRequest):
             cmd.append("--block-ads")
         if req.save_wayback:
             cmd.append("--save-wayback")
+        if req.engine:
+            cmd.extend(["--engine", req.engine])
+        if req.crawl_backend:
+            cmd.extend(["--crawl-backend", req.crawl_backend])
+        if req.archive_backend:
+            cmd.extend(["--archive-backend", req.archive_backend])
+        if req.include:
+            cmd.extend(["--include", req.include])
+        if req.exclude:
+            cmd.extend(["--exclude", req.exclude])
+        if req.headed:
+            cmd.append("--headed")
+        if req.cdp:
+            cmd.extend(["--cdp", req.cdp])
 
         command_preview = " ".join(cmd)
         yield f"🚀 Launching Death Star V2...\nCommand: {command_preview}\n\n"
 
+        env = os.environ.copy()
+        src_path = str(SCRIPT_DIR / "src")
+        existing_pythonpath = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = src_path if not existing_pythonpath else f"{src_path}{os.pathsep}{existing_pythonpath}"
+
         proc = subprocess.Popen(
             cmd,
             cwd=str(SCRIPT_DIR),
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
         )
-        
+
         try:
             for line in proc.stdout:
                 yield line
@@ -273,9 +309,9 @@ def get_html() -> str:
             --success: #2ed573;
             --terminal-bg: #1e1e1e;
         }
-        
+
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        
+
         body {
             background-color: var(--bg-dark);
             color: var(--text-main);
@@ -346,7 +382,7 @@ def get_html() -> str:
             overflow-y: auto;
             animation: fadeIn 0.3s ease;
         }
-        
+
         .view.active { display: block; }
 
         @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
@@ -361,7 +397,7 @@ def get_html() -> str:
         }
 
         .form-group { margin-bottom: 1.5rem; }
-        
+
         label {
             display: block;
             color: var(--text-dim);
@@ -380,7 +416,7 @@ def get_html() -> str:
             font-family: 'JetBrains Mono', monospace;
             border-radius: 4px;
         }
-        
+
         input:focus, select:focus {
             outline: none;
             border-color: var(--accent);
@@ -421,7 +457,7 @@ def get_html() -> str:
             letter-spacing: 0.1em;
             transition: transform 0.1s;
         }
-        
+
         .btn-action:active { transform: scale(0.98); }
         .btn-action:disabled { opacity: 0.5; cursor: wait; }
 
@@ -467,14 +503,14 @@ def get_html() -> str:
             overflow: hidden;
             position: relative;
         }
-        
+
         .card-img img { width: 100%; height: 100%; object-fit: cover; }
         .card-img .placeholder { color: var(--text-dim); font-size: 0.8rem; }
 
         .card-body { padding: 1rem; }
         .card-title { font-weight: bold; margin-bottom: 0.5rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .card-meta { font-size: 0.75rem; color: var(--text-dim); display: flex; justify-content: space-between; }
-        
+
         .badge {
             display: inline-block;
             padding: 0.2rem 0.5rem;
@@ -494,9 +530,9 @@ def get_html() -> str:
             z-index: 100;
             backdrop-filter: blur(5px);
         }
-        
+
         .modal-overlay.open { display: flex; }
-        
+
         .modal {
             background: var(--bg-panel);
             width: 90%;
@@ -508,7 +544,7 @@ def get_html() -> str:
             border-radius: 8px;
             box-shadow: 0 0 30px rgba(0,0,0,0.5);
         }
-        
+
         .modal-header {
             padding: 1rem 1.5rem;
             border-bottom: 1px solid var(--border);
@@ -516,7 +552,7 @@ def get_html() -> str:
             justify-content: space-between;
             align-items: center;
         }
-        
+
         .modal-body {
             flex: 1;
             padding: 1.5rem;
@@ -524,7 +560,7 @@ def get_html() -> str:
             display: flex;
             gap: 2rem;
         }
-        
+
         .modal-close {
             background: none;
             border: none;
@@ -532,12 +568,12 @@ def get_html() -> str:
             font-size: 1.5rem;
             cursor: pointer;
         }
-        
+
         .preview-col { flex: 2; display: flex; flex-direction: column; gap: 1rem; }
         .info-col { flex: 1; border-left: 1px solid var(--border); padding-left: 1.5rem; }
-        
+
         .preview-img { width: 100%; border: 1px solid var(--border); border-radius: 4px; }
-        
+
         .asset-list { list-style: none; margin-top: 1rem; }
         .asset-list li { margin-bottom: 0.5rem; }
         .asset-list a {
@@ -575,7 +611,7 @@ def get_html() -> str:
                 <label>Target URL</label>
                 <input type="url" id="targetUrl" placeholder="https://target-system.com" required>
             </div>
-            
+
             <div class="row">
                 <div class="col form-group">
                     <label>Mode</label>
@@ -586,11 +622,47 @@ def get_html() -> str:
                         <option value="smart">SMART (Adaptive)</option>
                         <option value="stealth">STEALTH (Anti-Bot)</option>
                         <option value="quick">QUICK (Static)</option>
+                        <option value="watch">WATCH (CDP Passive)</option>
                     </select>
                 </div>
                 <div class="col form-group">
+                    <label>Engine</label>
+                    <select id="engineSelect">
+                        <option value="auto">AUTO</option>
+                        <option value="playwright">PLAYWRIGHT</option>
+                        <option value="patchright">PATCHRIGHT</option>
+                        <option value="camoufox">CAMOUFOX</option>
+                        <option value="nodriver">NODRIVER</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="row">
+                <div class="col form-group">
+                    <label>Crawl Backend</label>
+                    <select id="crawlBackend">
+                        <option value="native">NATIVE</option>
+                        <option value="crawlee">CRAWLEE</option>
+                    </select>
+                </div>
+                <div class="col form-group">
+                    <label>Archive Backend</label>
+                    <select id="archiveBackend">
+                        <option value="native">NATIVE</option>
+                        <option value="archivebox">ARCHIVEBOX</option>
+                        <option value="browsertrix">BROWSERTRIX</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="row">
+                <div class="col form-group">
                     <label>Output Dir (Optional)</label>
                     <input type="text" id="outputDir" placeholder="output">
+                </div>
+                <div class="col form-group">
+                    <label>CDP Endpoint</label>
+                    <input type="text" id="cdpEndpoint" placeholder="http://localhost:9222">
                 </div>
             </div>
 
@@ -609,6 +681,23 @@ def get_html() -> str:
                 <label><input type="checkbox" id="optWacz"> Generate WACZ</label>
                 <label><input type="checkbox" id="optBlockAds"> Block ads/trackers</label>
                 <label><input type="checkbox" id="optWayback"> Save to Wayback</label>
+                <label><input type="checkbox" id="optHeaded"> Headed browser</label>
+            </div>
+
+            <div class="row">
+                <div class="col form-group">
+                    <label>Include URL Regex</label>
+                    <input type="text" id="includeRegex" placeholder="">
+                </div>
+                <div class="col form-group">
+                    <label>Exclude URL Regex</label>
+                    <input type="text" id="excludeRegex" placeholder="">
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label>Backend Availability</label>
+                <pre id="backendStatus" style="background: var(--bg-dark); border: 1px solid var(--border); padding: 0.8rem; max-height: 130px; overflow:auto; font-size:0.75rem;">Loading...</pre>
             </div>
 
             <button class="btn-action" id="launchBtn">INITIATE SEQUENCE</button>
@@ -645,7 +734,7 @@ def get_html() -> str:
             <div class="info-col">
                 <label>Mission Data</label>
                 <p style="margin-bottom: 1rem; font-size: 0.9rem; color: var(--text-dim);" id="modalMeta"></p>
-                
+
                 <label>Artifacts</label>
                 <ul class="asset-list" id="modalAssets"></ul>
             </div>
@@ -661,13 +750,29 @@ document.addEventListener('DOMContentLoaded', () => {
         captures: []
     };
 
+    async function loadDoctor() {
+        const el = document.getElementById('backendStatus');
+        if (!el) return;
+        try {
+            const res = await fetch('/api/doctor');
+            const data = await res.json();
+            const lines = (data.backends || []).map(item => {
+                const mark = item.available ? 'installed' : 'missing';
+                return `${mark.padEnd(9)} ${String(item.kind || '').padEnd(8)} ${item.name}`;
+            });
+            el.textContent = lines.join('\\n') || 'No backend report available.';
+        } catch (e) {
+            el.textContent = `Doctor failed: ${e.message}`;
+        }
+    }
+
     // --- NAVIGATION ---
     window.switchView = function(viewId) {
         document.querySelectorAll('.view').forEach(el => el.classList.remove('active'));
         document.querySelectorAll('nav button').forEach(el => el.classList.remove('active'));
-        
+
         document.getElementById(viewId).classList.add('active');
-        
+
         // Find button that calls this function and add active class
         const btn = Array.from(document.querySelectorAll('nav button')).find(b => b.getAttribute('onclick').includes(viewId));
         if (btn) btn.classList.add('active');
@@ -683,13 +788,13 @@ document.addEventListener('DOMContentLoaded', () => {
         launchBtn.addEventListener('click', async () => {
             const url = document.getElementById('targetUrl').value.trim();
             if (!url) return alert("Target URL required.");
-            
+
             console.log("Launching scrape for:", url);
             launchBtn.disabled = true;
             launchBtn.textContent = "SEQUENCE RUNNING...";
             launchBtn.style.opacity = "0.7";
             terminal.textContent = "Initializing sequence...\n";
-            
+
             const payload = {
                 url,
                 mode: document.getElementById('modeSelect').value,
@@ -699,6 +804,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 wacz: document.getElementById('optWacz').checked,
                 block_ads: document.getElementById('optBlockAds').checked,
                 save_wayback: document.getElementById('optWayback').checked,
+                engine: document.getElementById('engineSelect').value,
+                crawl_backend: document.getElementById('crawlBackend').value,
+                archive_backend: document.getElementById('archiveBackend').value,
+                include: document.getElementById('includeRegex').value || null,
+                exclude: document.getElementById('excludeRegex').value || null,
+                headed: document.getElementById('optHeaded').checked,
+                cdp: document.getElementById('cdpEndpoint').value || null,
             };
 
             try {
@@ -707,12 +819,12 @@ document.addEventListener('DOMContentLoaded', () => {
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify(payload)
                 });
-                
+
                 if (!res.ok) throw new Error(`Server returned ${res.status}`);
 
                 const reader = res.body.getReader();
                 const dec = new TextDecoder();
-                
+
                 while (true) {
                     const { done, value } = await reader.read();
                     if (done) break;
@@ -728,7 +840,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 launchBtn.disabled = false;
                 launchBtn.textContent = "INITIATE SEQUENCE";
                 launchBtn.style.opacity = "1";
-                loadArchives(); 
+                loadArchives();
             }
         });
     }
@@ -740,9 +852,9 @@ document.addEventListener('DOMContentLoaded', () => {
             const res = await fetch('/api/history');
             const data = await res.json();
             state.captures = data;
-            
+
             grid.innerHTML = '';
-            
+
             if (data.length === 0) {
                 grid.innerHTML = '<div style="color:var(--text-dim); grid-column: 1/-1; text-align:center; padding: 2rem;">No archives found in output directory.</div>';
                 return;
@@ -752,14 +864,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 const card = document.createElement('div');
                 card.className = 'card';
                 card.onclick = () => openDetail(item);
-                
+
                 let thumb = null;
                 if (item.assets && item.assets.screenshot) {
                     thumb = `/files/${item.assets.screenshot}`;
                 }
-                
-                const imgHtml = thumb 
-                    ? `<img src="${thumb}" loading="lazy">` 
+
+                const imgHtml = thumb
+                    ? `<img src="${thumb}" loading="lazy">`
                     : `<div class="placeholder">NO VISUAL</div>`;
 
                 const ts = String(item.timestamp || "Unknown");
@@ -786,7 +898,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- MODAL ---
     window.openDetail = function(item) {
         document.getElementById('modalTitle').textContent = item.url;
-        
+
         // Meta
         const metaHtml = `
             <strong>Time:</strong> ${item.timestamp}<br>
@@ -806,7 +918,7 @@ document.addEventListener('DOMContentLoaded', () => {
         // Assets
         const list = document.getElementById('modalAssets');
         list.innerHTML = '';
-        
+
         // Standard links
         const standardLinks = [
             { k: 'dom', l: 'DOM Snapshot (HTML)', i: '📄' },
@@ -829,13 +941,13 @@ document.addEventListener('DOMContentLoaded', () => {
                     list.appendChild(li);
                 }
             });
-            
+
             // Add other assets dynamically
             for (const [key, val] of Object.entries(item.assets)) {
                 if (standardLinks.some(sl => sl.k === key) || key === 'screenshot') continue;
                 // Avoid showing nulls or non-strings
                 if (!val || typeof val !== 'string') continue;
-                
+
                 const li = document.createElement('li');
                 li.innerHTML = `<a href="/files/${val}" target="_blank">📂 ${key.toUpperCase()}</a>`;
                 list.appendChild(li);
@@ -853,6 +965,8 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('detailModal').addEventListener('click', (e) => {
         if (e.target.id === 'detailModal') closeModal();
     });
+
+    loadDoctor();
 
 });
 </script>

@@ -1,27 +1,38 @@
-# Death Star Versioning: Current vs Deprecated
+# Death Star Versioning
 
-## Current: Death Star V2
+## Current: Canonical Death Star V2
 
-**Location:** `src/scraping/core/`
+**Location:** `src/scraping/core/death_star_v2.py`
 
 **Entry points:**
-- From repo root: `PYTHONPATH=src python -m scraping.core.death_star_v2 --target URL --mode MODE`
-- From core dir: `python death_star_v2.py --target URL --mode MODE`
+- Module: `python -m scraping.core.death_star_v2 --target URL --mode MODE`
+- Repo compatibility wrapper: `python death_star_v2.py --target URL --mode MODE`
+- Installed console scripts: `death-star` and `ds-scrape`
+- Package compatibility wrapper: `python -m death_star.cli --target URL --mode MODE`
+- Dashboard launcher: `dashboard.py`, which invokes `python -m scraping.core.death_star_v2`
 
-**Use this for:** All new work. Full forensic capture, ultimate mode (advanced + forensic + Wayback), and all other modes work as documented.
+Use this implementation for all new work. The installed CLI, root wrapper, package wrapper, and dashboard now route to the same canonical V2 engine.
 
-**Docs:** [DEATH_STAR_V2_COMPLETE.md](DEATH_STAR_V2_COMPLETE.md), [../src/scraping/README.md](../src/scraping/README.md)
+## Compatibility Surface
 
----
+The root `death_star_v2.py` file and the `death_star/` package are compatibility shims only. They preserve older commands while delegating behavior to the canonical V2 module.
 
-## Deprecated: death_star package (pip)
+Do not add new scraper behavior under `death_star/` unless it is strictly wrapper compatibility. New fetch, crawl, archive, extractor, replay, manifest, and dashboard behavior belongs under `src/scraping/core/`.
 
-**Location:** `death_star/` (pip install: `death-star-scraper`)
+## Optional Backends
 
-**Entry point:** `death-star --target URL` or `python -m death_star.cli --target URL`
+Optional tools are detected at runtime through `death-star --doctor` and recorded in every run as `backend_report.json` and `tool_versions.json`.
 
-**Status:** Deprecated. Do not use for new work.
+GPL/AGPL applications such as Browsertrix, SingleFile, pywb, wget, and nodriver stay outside the runtime package path. Death Star invokes them only through CLI/container boundaries and records provenance in run manifests and command reports.
 
-**Why deprecated:** The package only performs a basic browser crawl. The `forensic` and `ultimate` modes do **not** run the full forensic/ultimate pipelines (no full WARC/HAR/API capture, no advanced capture, no Wayback). That behavior exists only in V2.
+## Run Contract
 
-**Migration:** Use Death Star V2 (above) for full behavior. See [../death_star/README.md](../death_star/README.md).
+Every canonical V2 run writes a timestamped run directory under the selected output root with:
+
+- `manifest.json`
+- `events.jsonl`
+- `backend_report.json`
+- `tool_versions.json`
+- `pages/`, `assets/`, `warc/`, `har/`, `wacz/`, `extract/`, `screenshots/`, `replay/`
+
+Manifests record cookie/proxy/auth presence as booleans only. Secrets must not be written to manifests or logs.

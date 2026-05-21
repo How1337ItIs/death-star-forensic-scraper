@@ -53,20 +53,51 @@ dependencies = [
 [project.optional-dependencies]
 browser = [
     "playwright>=1.40.0",
+    "patchright>=1.40.0",
+    "camoufox>=0.4.0",
+    "nodriver>=0.40.0",
 ]
 stealth = [
     "playwright>=1.40.0",
+    "patchright>=1.40.0",
+    "camoufox>=0.4.0",
+    "nodriver>=0.40.0",
     "curl_cffi>=0.7.0",
     "browserforge>=1.0.0",
     "browser-cookie3",
     "capsolver",
 ]
+archive = [
+    "archivebox>=0.7.0",
+    "wacz>=0.4.0",
+]
+crawl = [
+    "crawlee>=0.6.0",
+]
+extract = [
+    "markitdown>=0.1.0",
+    "docling>=2.0.0",
+]
+crawl4ai = [
+    "Crawl4AI>=0.7.0",
+]
+scrapling = [
+    "scrapling>=0.4.0",
+]
 full = [
     "playwright>=1.40.0",
+    "patchright>=1.40.0",
+    "camoufox>=0.4.0",
+    "nodriver>=0.40.0",
     "curl_cffi>=0.7.0",
     "browserforge>=1.0.0",
     "browser-cookie3",
     "capsolver",
+    "archivebox>=0.7.0",
+    "wacz>=0.4.0",
+    "crawlee>=0.6.0",
+    "markitdown>=0.1.0",
+    "docling>=2.0.0",
     "Pillow>=10.0.0",
     "dnspython>=2.4.0",
     "selectolax",
@@ -86,12 +117,12 @@ Repository = "https://github.com/yourorg/death-star-scraper"
 Issues = "https://github.com/yourorg/death-star-scraper/issues"
 
 [project.scripts]
-death-star = "death_star.cli:main"
-ds-scrape = "death_star.cli:main"
+death-star = "scraping.core.death_star_v2:main"
+ds-scrape = "scraping.core.death_star_v2:main"
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["death_star*"]
+where = [".", "src"]
+include = ["death_star*", "scraping*"]
 
 [tool.setuptools.package-data]
 death_star = ["py.typed"]
@@ -102,6 +133,8 @@ target-version = ['py310', 'py311', 'py312']
 
 [tool.ruff]
 line-length = 100
+
+[tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
 ignore = ["E501"]
 
