@@ -1137,6 +1137,7 @@ class PlaywrightFetcher:
         self._playwright = None
         self._is_cdp = False  # True when connected via CDP
         self._is_camoufox = False
+        self._is_nodriver = False
         self._captured_graphql: List[Dict] = []  # Intercepted GraphQL responses
         self._block_rules_installed = False
         self._blocked_request_count = 0
@@ -1162,8 +1163,6 @@ class PlaywrightFetcher:
         elif engine == "camoufox":
             logger.info("Using camoufox (Firefox-based stealth)")
             from camoufox.async_api import AsyncCamoufox  # noqa: F401
-        elif engine == "nodriver":
-            logger.warning("nodriver runtime adapter is not implemented in this pipeline; falling back to playwright")
 
         # Default: standard playwright
         from playwright.async_api import async_playwright
@@ -1178,8 +1177,45 @@ class PlaywrightFetcher:
         if self.config.cdp_endpoint:
             return await self._connect_cdp()
 
+        if self.config.browser_engine == "nodriver":
+            return await self._launch_nodriver()
+
         # --- Standard launch mode ---
         return await self._launch_browser()
+
+    async def _launch_nodriver(self) -> bool:
+        """Launch nodriver as an optional raw-CDP browser engine."""
+        try:
+            import nodriver as uc
+        except ImportError:
+            logger.error("nodriver not installed. Run: pip install nodriver")
+            return False
+
+        browser_args = [
+            "--window-size=1920,1080",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+        ]
+        if self.config.headless:
+            browser_args.append("--headless=new")
+        if self.proxy_pool:
+            logger.warning("nodriver proxy handoff is not supported yet; launching without proxy")
+
+        try:
+            self._browser = await uc.start(
+                headless=self.config.headless,
+                browser_args=browser_args,
+                lang="en-US",
+            )
+            self._is_nodriver = True
+            logger.info("nodriver browser launched")
+            return True
+        except Exception as e:
+            logger.error(f"nodriver launch failed: {e}")
+            self._browser = None
+            self._is_nodriver = False
+            return False
 
     async def _connect_cdp(self) -> bool:
         """Connect to a running Chrome instance via CDP."""
@@ -1550,6 +1586,9 @@ class PlaywrightFetcher:
         if not await self._ensure_browser():
             return None
 
+        if self._is_nodriver:
+            return await self._fetch_nodriver(url)
+
         page = None
         try:
             page = await self._context.new_page()
@@ -1672,6 +1711,97 @@ class PlaywrightFetcher:
             if page and not self._is_cdp:
                 await page.close()
 
+    async def _fetch_nodriver(self, url: str) -> Optional[ScrapedPage]:
+        """Fetch a page through nodriver and adapt it to the ScrapedPage contract."""
+        if not self._browser:
+            return None
+
+        tab = None
+        try:
+            tab = await self._browser.get(url)
+            await asyncio.sleep(max(0.2, float(self._get_behavior_profile().get("post_load_delay", 0.2))))
+
+            if self.config.net_idle_wait > 0:
+                await asyncio.sleep(min(self.config.net_idle_wait, 5))
+
+            for _ in range(max(0, int(self._get_behavior_profile().get("scroll_passes", 0)))):
+                try:
+                    await tab.scroll_down(5)
+                    await asyncio.sleep(0.2)
+                except Exception:
+                    break
+
+            raw_html = await tab.get_content()
+            final_url = getattr(getattr(tab, "target", None), "url", None) or url
+            title = await tab.evaluate("document.title || ''", return_by_value=True)
+            clean_text = await tab.evaluate(
+                """
+                (() => {
+                    if (!document.body) return '';
+                    const clone = document.body.cloneNode(true);
+                    clone.querySelectorAll('script, style, noscript').forEach((el) => el.remove());
+                    return clone.innerText || '';
+                })()
+                """,
+                return_by_value=True,
+            )
+            links_json = await tab.evaluate(
+                "JSON.stringify(Array.from(document.querySelectorAll('a[href]')).map(a => a.href).filter(Boolean))",
+                return_by_value=True,
+            )
+            media_json = await tab.evaluate(
+                "JSON.stringify(Array.from(document.querySelectorAll('img[src], video[src], audio[src]')).map(el => el.src).filter(Boolean))",
+                return_by_value=True,
+            )
+
+            try:
+                links = json.loads(links_json or "[]")
+            except Exception:
+                links = []
+            try:
+                media = json.loads(media_json or "[]")
+            except Exception:
+                media = []
+
+            clean_text = str(clean_text or "")
+            title = str(title or "")
+            content_hash = hashlib.sha256(clean_text.encode()).hexdigest()[:16]
+            metadata = {
+                "screenshot": False,
+                "js_rendered": True,
+                "browser_engine": "nodriver",
+                "cdp_mode": False,
+                "status_source": "nodriver does not expose navigation status directly",
+                "block_rules_enabled": False,
+                "behavior_profile": self.config.behavior_profile,
+            }
+
+            return ScrapedPage(
+                url=url,
+                final_url=final_url,
+                status_code=200,
+                content_type="text/html",
+                raw_html=raw_html,
+                clean_text=clean_text,
+                markdown=clean_text,
+                title=title,
+                links=links,
+                media=media,
+                metadata=metadata,
+                scraped_at=datetime.now().isoformat(),
+                method="nodriver",
+                content_hash=content_hash,
+            )
+        except Exception as e:
+            logger.warning(f"nodriver fetch failed for {url}: {e}")
+            return None
+        finally:
+            if tab:
+                try:
+                    await tab.close()
+                except Exception:
+                    pass
+
     async def fetch_with_escalation(self, url: str) -> Optional[ScrapedPage]:
         """
         Try fetching with the configured engine; on anti-bot block, escalate
@@ -1789,6 +1919,15 @@ class PlaywrightFetcher:
             self._browser = None
             self._context = None
             self._is_camoufox = False
+        elif self._is_nodriver:
+            if self._browser:
+                try:
+                    self._browser.stop()
+                except Exception:
+                    pass
+            self._browser = None
+            self._context = None
+            self._is_nodriver = False
         else:
             if self._browser:
                 await self._browser.close()
@@ -1876,15 +2015,47 @@ class WgetFetcher:
 
 class ArchiveBoxFetcher:
     """Full archival using ArchiveBox (HTML, PDF, screenshots, WARC)."""
+    DOCKER_IMAGE = "archivebox/archivebox:latest"
 
     def __init__(self, config: ScrapeConfig, output_dir: Path):
         self.config = config
         self.output_dir = output_dir
+        self._archivebox_cli = resolve_cli("archivebox")
+        self._docker_cli = resolve_cli("docker")
+        self._backend_kind: Optional[str] = None
         self._available = self._check_archivebox()
 
     def _check_archivebox(self) -> bool:
         """Check if archivebox is available."""
-        return resolve_cli("archivebox") is not None
+        if self._archivebox_cli and self._archivebox_cli_usable(self._archivebox_cli):
+            self._backend_kind = "cli"
+            return True
+        if self._docker_cli:
+            self._backend_kind = "docker"
+            return True
+        return False
+
+    @staticmethod
+    def _archivebox_cli_usable(cli_path: str) -> bool:
+        try:
+            result = subprocess.run(
+                [cli_path, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _docker_reachable_url(url: str) -> str:
+        parsed = urlparse(url)
+        if parsed.hostname in {"127.0.0.1", "localhost"}:
+            port = f":{parsed.port}" if parsed.port else ""
+            netloc = f"host.docker.internal{port}"
+            return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
+        return url
 
     def archive_url(self, url: str) -> Optional[Path]:
         """Archive a URL with all formats."""
@@ -1896,24 +2067,36 @@ class ArchiveBoxFetcher:
             "source_url": "https://github.com/ArchiveBox/ArchiveBox",
             "license": "MIT",
             "available": self._available,
+            "backend_kind": self._backend_kind,
             "url": url,
             "output_path": str(output_path),
             "commands": [],
         }
 
         if not self._available:
-            command_report["error"] = "archivebox CLI missing; install with `pip install archivebox`"
+            command_report["error"] = "archivebox unavailable; install the CLI or Docker and pull archivebox/archivebox"
             (output_path / "archivebox_command.json").write_text(
                 json.dumps(command_report, indent=2, default=str),
                 encoding="utf-8",
             )
-            logger.warning("archivebox not available. Install: pip install archivebox")
+            logger.warning("archivebox not available. Install Docker or the archivebox CLI.")
             return None
 
+        if self._backend_kind == "docker":
+            return self._archive_url_docker(url, output_path, command_report)
+
+        return self._archive_url_cli(url, output_path, command_report)
+
+    def _archive_url_cli(
+        self,
+        url: str,
+        output_path: Path,
+        command_report: Dict[str, Any],
+    ) -> Optional[Path]:
         logger.info(f"ARCHIVEBOX: Archiving {url}")
 
         # Initialize if needed
-        archivebox_cli = resolve_cli("archivebox") or "archivebox"
+        archivebox_cli = self._archivebox_cli or "archivebox"
         init_cmd = [archivebox_cli, "init", "--setup"]
         command_report["commands"].append(init_cmd)
         subprocess.run(init_cmd, cwd=output_path, capture_output=True)
@@ -1961,6 +2144,88 @@ class ArchiveBoxFetcher:
                 encoding="utf-8",
             )
             logger.error(f"ARCHIVEBOX failed: {e}")
+            return None
+
+    def _archive_url_docker(
+        self,
+        url: str,
+        output_path: Path,
+        command_report: Dict[str, Any],
+    ) -> Optional[Path]:
+        docker_url = self._docker_reachable_url(url)
+        docker = self._docker_cli or "docker"
+        volume = f"{output_path}:/data"
+        init_cmd = [
+            docker,
+            "run",
+            "--rm",
+            "-v",
+            volume,
+            self.DOCKER_IMAGE,
+            "init",
+            "--setup",
+        ]
+        add_cmd = [
+            docker,
+            "run",
+            "--rm",
+            "-v",
+            volume,
+            self.DOCKER_IMAGE,
+            "add",
+            docker_url,
+            f"--depth={min(self.config.max_depth, 3)}",
+            "--parser=auto",
+        ]
+        command_report["commands"].extend([init_cmd, add_cmd])
+        command_report["docker_url"] = docker_url
+        command_report["docker_image"] = self.DOCKER_IMAGE
+
+        try:
+            init_result = subprocess.run(
+                init_cmd,
+                cwd=output_path,
+                capture_output=True,
+                text=True,
+                timeout=900,
+            )
+            add_result = subprocess.run(
+                add_cmd,
+                cwd=output_path,
+                capture_output=True,
+                text=True,
+                timeout=7200,
+            )
+            command_report["command_results"] = [
+                {
+                    "name": "init",
+                    "returncode": init_result.returncode,
+                    "stdout_tail": (init_result.stdout or "")[-4000:],
+                    "stderr_tail": (init_result.stderr or "")[-4000:],
+                },
+                {
+                    "name": "add",
+                    "returncode": add_result.returncode,
+                    "stdout_tail": (add_result.stdout or "")[-4000:],
+                    "stderr_tail": (add_result.stderr or "")[-4000:],
+                },
+            ]
+            (output_path / "archivebox_command.json").write_text(
+                json.dumps(command_report, indent=2, default=str),
+                encoding="utf-8",
+            )
+            if init_result.returncode == 0 and add_result.returncode == 0:
+                logger.info(f"ARCHIVEBOX Docker complete: {output_path}")
+                return output_path
+            logger.warning(f"ARCHIVEBOX Docker issues: {(add_result.stderr or init_result.stderr)[:200]}")
+            return None
+        except Exception as e:
+            command_report["error"] = str(e)
+            (output_path / "archivebox_command.json").write_text(
+                json.dumps(command_report, indent=2, default=str),
+                encoding="utf-8",
+            )
+            logger.error(f"ARCHIVEBOX Docker failed: {e}")
             return None
 
 
@@ -2240,7 +2505,7 @@ class DeathStarV2:
 
         tools = {
             "wget": resolve_cli("wget") is not None,
-            "archivebox": resolve_cli("archivebox") is not None,
+            "archivebox": resolve_cli("archivebox") is not None or resolve_cli("docker") is not None,
             "playwright": self._check_module("playwright"),
             "trafilatura": self._check_module("trafilatura"),
             "requests": self._check_module("requests"),
@@ -2945,8 +3210,6 @@ class DeathStarV2:
             # Crawl and scrape
             use_browser = mode == "stealth"
 
-            self._append_weapon(results, "http" if not use_browser else "playwright")
-
             # Process queue
             output_path = self.output_dir / "pages" / safe_domain
             output_path.mkdir(parents=True, exist_ok=True)
@@ -2971,6 +3234,7 @@ class DeathStarV2:
                         page = await self.scrape_page(page_url, use_browser=use_browser)
 
                         if page:
+                            self._append_weapon(results, page.method)
                             # Check for duplicate content
                             if self.config.deduplicate:
                                 if self.checkpoint.is_duplicate_content(page.content_hash):

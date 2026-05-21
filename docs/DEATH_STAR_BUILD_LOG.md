@@ -121,3 +121,13 @@
 - `python scripts\death_star_smoke.py --forensic --output %TEMP%\death-star-final-smoke`
 - Optional probe verified Playwright, Patchright escalation, Camoufox, nodriver fallback, all page extractors, Crawlee selection, ArchiveBox manifest failure reporting, Browsertrix Docker WARC/WACZ output, pywb replay preparation, and SingleFile CLI capture.
 - `python -m pip check` still reports global dependency metadata conflicts for beets/numpy, Crawl4AI/Scrapling lxml, fastapi/anyio, njsparser/typer, and spotdl/rich.
+
+### Fix-Everything Pass
+- Updated the local Codex `death-star-scraper` skill to point future agents at canonical V2 commands, `--doctor`, dashboard launch, optional extras, Docker ArchiveBox, WACZ/replay, and dirty-file safety.
+- Implemented a real nodriver runtime adapter for `--engine nodriver`; it now launches nodriver, captures rendered HTML/text/links/media, and writes `method=nodriver`.
+- Added ArchiveBox Docker fallback using `archivebox/archivebox:latest` when the native Windows CLI is installed but unusable. Localhost targets are translated to `host.docker.internal` for Docker.
+- Added a Windows py-wacz wrapper that normalizes ZIP entry paths during native WACZ generation.
+- Added WACZ local structural validation fallback for py-wacz Windows validation false negatives.
+- Pulled `archivebox/archivebox:latest`.
+- Tried safe dependency resolver repairs. `pip check` cannot be fully clean while the current installed package set contains incompatible release metadata: Crawl4AI vs Scrapling/njsparser on `lxml`, njsparser vs HuggingFace/Docling on `typer`, spotdl vs dashboard/Crawl4AI on FastAPI/AnyIO/Rich, and beets vs OpenCV on NumPy. The Death Star runtime checks pass with the current selected versions.
+- Targeted probes passed for real nodriver scraping, native WACZ creation/structural validation, and ArchiveBox Docker archival.

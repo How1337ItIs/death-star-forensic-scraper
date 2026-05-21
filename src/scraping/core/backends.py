@@ -132,6 +132,7 @@ BACKENDS: tuple[BackendSpec, ...] = (
         import_name="archivebox",
         distribution_names=("archivebox",),
         cli_names=("archivebox",),
+        risk_note="Native CLI may not run on Windows; Death Star falls back to archivebox/archivebox Docker when Docker is available.",
     ),
     BackendSpec(
         name="Browsertrix Docker",

@@ -30,6 +30,7 @@ python -m playwright install chromium
 python -m patchright install chromium
 python -m camoufox fetch
 docker pull webrecorder/browsertrix-crawler
+docker pull archivebox/archivebox:latest
 ```
 
 External archive/replay tools are optional. Use `death-star --doctor` to see what is installed.
@@ -85,16 +86,17 @@ Manifest paths are relative where possible. Cookie, proxy, and auth values are n
 Use local dependencies where they are permissively licensed and lightweight. Keep full applications and copyleft projects behind subprocess or container boundaries:
 
 - Browsertrix: Docker command report under `browsertrix/browsertrix_command.json`.
-- ArchiveBox: CLI command report under `archivebox/<domain>/archivebox_command.json`.
+- ArchiveBox: CLI/Docker command report under `archivebox/<domain>/archivebox_command.json`.
 - pywb: replay command report under `replay/pywb_replay.json`.
 - wacz: post-processing only when the `wacz` CLI/module is available.
 
 Known Windows notes:
 
-- ArchiveBox 0.7.1 installs but its native Windows CLI currently fails on `os.getuid`; Death Star records the failed command under `archivebox/<domain>/archivebox_command.json`.
+- ArchiveBox 0.7.1 installs but its native Windows CLI currently fails on `os.getuid`; Death Star falls back to `archivebox/archivebox:latest` through Docker when Docker is available.
 - pywb should be installed through `uv tool install pywb --python 3.12 --with "setuptools<81"` on Python 3.13 hosts because the PyPI dependency set is not compatible with Python 3.13 in-process.
-- py-wacz 0.4.9 installs and is detected, but native WACZ generation can fail on Windows path handling. Browsertrix Docker WACZ generation is the tested WACZ path on this host.
+- py-wacz 0.4.9 installs and is detected. Death Star runs a Windows wrapper for native WACZ generation to normalize ZIP paths, and uses a local structural validator when `wacz validate` reports Windows path false negatives.
 - Crawl4AI 0.7.8 and Scrapling 0.4.8 currently declare incompatible `lxml` requirements. Both import and the Death Star extractor tests pass here, but `pip check` reports that package metadata conflict.
+- `pip check` can also report unrelated global-environment conflicts from packages outside Death Star, including beets/numpy, njsparser/typer, and spotdl/FastAPI/Rich.
 
 Missing optional tools are warnings, manifest notes, and `skipped_optional_backend` events unless the selected mode cannot produce any useful output.
 
